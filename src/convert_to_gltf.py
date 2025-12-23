@@ -31,12 +31,14 @@ def svg_to_triangles_with_holes(file_path, name: str, builder: MeshBuilder):
     paths = svg2paths(file_path)[0]
 
     counter = 0
+    print(f"  {len(paths)} Paths")
 
     for super_path in paths:
         outline = []
         holes = []
 
         subpaths = super_path.continuous_subpaths()
+        print(f"  {len(subpaths)} Subpaths")
         for i, path in enumerate(subpaths):
             if not path.isclosed():
                 continue  # We can only triangulate closed shapes
@@ -101,53 +103,12 @@ def svg_to_triangles_with_holes(file_path, name: str, builder: MeshBuilder):
         counter += 1
 
 
-def save_as_obj(vertices, triangles, filename="output.obj"):
-    """
-    Saves vertices and triangles to a Wavefront .obj file.
-
-    Args:
-        vertices: numpy array of shape (N, 2) or (N, 3)
-        triangles: numpy array of shape (M, 3) - indices of vertices
-        filename: string path to the output file
-    """
-    with open(filename, "w") as f:
-        f.write("# Generated SVG to OBJ Converter\n")
-
-        # 1. Write Vertices
-        for v in vertices:
-            # If 2D (x, y), add a 0 for z.
-            height = v[2] if len(v) > 2 else 0.0
-            f.write(f"v {v[0]} {height} {v[1]}\n")
-
-        # 2. Write Faces (Triangles)
-        # OBJ indices start at 1, so we add 1 to every index
-        for t in triangles:
-            f.write(f"f {t[0]+1} {t[1]+1} {t[2]+1}\n")
-
-    print(f"Successfully saved to {filename}")
-
-
-# Usage:
-# verts, tris = svg_to_triangles_with_holes('complex_logo.svg')
-# save_as_obj(verts, tris, "my_model.obj")
-
-# Usage
 if __name__ == "__main__":
     builder = MeshBuilder()
-    builder.create_mesh(
-        "test",
-        [0, 1, 2, 2, 3, 1],
-        [
-            [0, 0, 0],
-            [0, 0, 1],
-            [1, 0, 0],
-            [1, 0, 1],
-        ],
-    )
 
     for component in ["windows", "walls", "doors", "rooms"]:
         print(component)
-        svg_to_triangles_with_holes(f"output/example.{component}.svg", component, builder)
+        svg_to_triangles_with_holes(f"output/curves.{component}.svg", component, builder)
 
     gltf = builder.build()
     gltf.export_glb("output/output.glb", embed_buffer_resources=True)
