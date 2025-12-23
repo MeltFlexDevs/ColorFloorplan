@@ -4,6 +4,7 @@ from subprocess import run
 import numpy as np
 import PIL
 import PIL.Image
+import PIL.ImageFilter
 
 
 def main():
@@ -15,16 +16,30 @@ def main():
     pixels = np.array(input_image)
 
     output = output_dir / input.stem
+    threshold = 127
 
-    for component, color in [
-        ("windows", np.array([255, 0, 0])),
-        ("doors", np.array([0, 255, 0])),
-        ("walls", np.array([0, 0, 255])),
-        ("rooms", np.array([255, 255, 255])),
+    for component, colors in [
+        ("windows", [np.array([255, 0, 0])]),
+        ("doors", [np.array([0, 255, 0])]),
+        ("walls", [np.array([0, 0, 255])]),
+        ("rooms", [np.array([255, 255, 255]), np.array([0, 0, 0])]),
     ]:
+        if component == "rooms":
+            pixels = np.array(input_image.filter(PIL.ImageFilter.GaussianBlur(2)))
+            threshold = 200
+
         # Get pixels of the required colors
-        distances = np.linalg.norm(pixels - color, axis=2)
-        matches = np.where(distances < 127, 0, 255).astype(np.uint8)
+        combined_matches = np.zeros(pixels.shape[:2], dtype=bool)
+
+        for color in colors:
+            # Calculate distance for this specific color
+            distances = np.linalg.norm(pixels - color, axis=2)
+
+            # Combine with previous matches using logical OR (at least one match)
+            combined_matches = np.logical_or(combined_matches, distances < threshold)
+
+        # Convert boolean mask to 0/255 uint8 format
+        matches = np.where(combined_matches, 0, 255).astype(np.uint8)
 
         # Save the intermediate image
         grayscale = np.repeat(matches[:, :, np.newaxis], 3, axis=2)
