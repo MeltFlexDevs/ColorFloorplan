@@ -1,5 +1,6 @@
 from pathlib import Path
 from subprocess import run
+from sys import argv
 
 import numpy as np
 import PIL
@@ -7,8 +8,8 @@ import PIL.Image
 import PIL.ImageFilter
 
 
-def main():
-    input = Path("examples/example.ai.png")
+def main(filename: str):
+    input = Path(filename)
     output_dir = Path("output")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -55,4 +56,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(argv[1])

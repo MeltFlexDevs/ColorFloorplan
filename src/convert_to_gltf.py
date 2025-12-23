@@ -1,3 +1,5 @@
+from sys import argv
+
 import numpy as np
 from mapbox_earcut import triangulate_float32
 from shapely import difference, union_all
@@ -105,10 +107,11 @@ def svg_to_triangles_with_holes(file_path, name: str, builder: MeshBuilder):
 
 if __name__ == "__main__":
     builder = MeshBuilder()
+    name = argv[1]
 
     for component in ["windows", "walls", "doors", "rooms"]:
         print(component)
-        svg_to_triangles_with_holes(f"output/curves.{component}.svg", component, builder)
+        svg_to_triangles_with_holes(f"output/{name}.{component}.svg", component, builder)
 
     gltf = builder.build()
-    gltf.export_glb("output/output.glb", embed_buffer_resources=True)
+    gltf.export_glb(f"output/{name}.glb", embed_buffer_resources=True)

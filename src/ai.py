@@ -1,5 +1,6 @@
 from mimetypes import guess_extension, guess_type
 from pathlib import Path
+from sys import argv
 from time import strftime
 
 from google import genai
@@ -39,13 +40,13 @@ The OUTPUT style must match EXAMPLE OUTPUT (second image) image.
 OUTPUT: Clean drawing on white background with walls filled solid blue, doors with solid green, windows with solid red, exact proportions preserved."""
 
 
-def main():
+def main(filename: str):
     credentials = service_account.Credentials.from_service_account_file(
         filename="gcp-credentials.json",
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
 
-    input_file = Path("examples/complex.png")
+    input_file = Path(filename)
     input_image = genai.types.Part.from_bytes(mime_type=guess_type(input_file)[0] or "", data=input_file.read_bytes())
 
     with genai.Client(
@@ -88,4 +89,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(argv[1])
