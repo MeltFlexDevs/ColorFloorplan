@@ -11,6 +11,14 @@ REFERENCE IMAGE (first image): Shows EXACT symbols for doors and windows. Detect
 - Door: Wall opening + quarter-circle arc
 - Window: 3 parallel lines in wall
 
+EXAMPLE OUTPUT (second image): Shows the REQUIRED style of the output image
+- The OUTPUT style must match EXAMPLE OUTPUT (second image) image.
+- The EXAMPLE should only be used for determining the style, the layout of the output floorplan MUST be according to the INPUT IMAGE
+
+INPUT IMAGE (third image):
+- This is the floorplan, based on which the layout of the OUTPUT image should be determined
+- The layout (positions and shapes of walls, doors and windows) of the output floorplan MUST be according to the INPUT IMAGE
+
 CRITICAL - PRESERVE PROPORTIONS:
 - Keep exact aspect ratio and dimensions of floorplan
 - Maintain precise room sizes and relationships
