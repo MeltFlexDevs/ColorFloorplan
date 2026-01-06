@@ -23,12 +23,7 @@ def main(filename: str):
         ("windows", [np.array([255, 0, 0])]),
         ("doors", [np.array([0, 255, 0])]),
         ("walls", [np.array([0, 0, 255])]),
-        ("rooms", [np.array([255, 255, 255]), np.array([0, 0, 0])]),
     ]:
-        if component == "rooms":
-            pixels = np.array(input_image.filter(PIL.ImageFilter.GaussianBlur(2)))
-            threshold = 200
-
         # Get pixels of the required colors
         combined_matches = np.zeros(pixels.shape[:2], dtype=bool)
 

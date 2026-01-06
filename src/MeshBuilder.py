@@ -20,13 +20,24 @@ class MeshBuilder:
         self.gltf_meshes: list[Mesh] = []
         self.vertex_stack: list[list[float]] = []
         self.index_stack: list[int] = []
+
+        self.counters: dict[str, int] = {}
         pass
+
+    def resolve_name_with_counter(self, name: str):
+        if not name.endswith("_"):
+            return name
+
+        count = self.counters.get(name, 1)
+        self.counters[name] = count + 1
+        return f"{name}{count}"
 
     def create_mesh(self, name: str | list[str], indices, vertices, invert_normals=False):
         if type(name) == str:
+            name = self.resolve_name_with_counter(name)
             names = [name]
         else:
-            names = name
+            names = [self.resolve_name_with_counter(v) for v in name]
             name = names[0]
 
         # 1. Define the Mesh Data (Vertices and Indices)
