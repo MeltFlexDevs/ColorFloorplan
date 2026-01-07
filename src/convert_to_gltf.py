@@ -10,7 +10,8 @@ from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 from svgpathtools import svg2paths
 
-from MeshBuilder import MeshBuilder
+from .config import DELETE_SVG, OUTPUT_FOLDER
+from .MeshBuilder import MeshBuilder
 
 
 def path_to_points(path, distance_step=1.0):
@@ -34,6 +35,7 @@ def path_to_points(path, distance_step=1.0):
 
 
 def load_shapes(file_path):
+    print(f"load_shapes({file_path})")
     paths = svg2paths(file_path)[0]
 
     for super_path in paths:
@@ -112,7 +114,7 @@ def svg_to_triangles_with_holes(file_path, name: str, builder: MeshBuilder):
         counter += 1
 
 
-def build_shape(name: str, merged: "list[Polygon]"):
+def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
     final_vertices = []
     final_indices = []
     v_offset = 0
@@ -188,15 +190,20 @@ def simplify_polygon(polygon: Polygon):
     return polygon
 
 
-if __name__ == "__main__":
+def convert_to_gltf(name: str):
+    print(f"convert_to_gltf({name})")
     builder = MeshBuilder()
-    name = argv[1]
 
     all_shapes: list[Shape] = []
 
     for component in ["windows", "walls", "doors"]:
-        for shape in load_shapes(f"output/{name}.{component}.svg"):
+        filename = OUTPUT_FOLDER / f"{name}.{component}.svg"
+
+        for shape in load_shapes(filename):
             all_shapes.append(Shape(component, list(shape)))
+
+        if DELETE_SVG:
+            filename.unlink()
 
     # Calculate average door width in pixels
     door_average_sum = 0
@@ -227,7 +234,7 @@ if __name__ == "__main__":
 
     # Build wall geometry
     for shape in all_shapes:
-        build_shape(shape.kind, shape.polygons)
+        build_shape(shape.kind, shape.polygons, builder)
 
     # Combine all walls for cutting out room shapes
     all_polygons = list(chain.from_iterable(shape.polygons for shape in all_shapes))
@@ -251,8 +258,15 @@ if __name__ == "__main__":
 
     # Build floor meshes
     for room in rooms:
-        build_shape("room", [buffer(room, 15 * normalizer)])
+        build_shape("room", [buffer(room, 15 * normalizer)], builder)
 
     gltf = builder.build()
-    with open(f"output/{name}.glb", "wb") as file:
+    return gltf
+
+
+if __name__ == "__main__":
+    name = argv[1]
+    gltf = convert_to_gltf(name)
+
+    with open(OUTPUT_FOLDER / f"{name}.glb", "wb") as file:
         gltf.write_glb(file, save_file_resources=False)

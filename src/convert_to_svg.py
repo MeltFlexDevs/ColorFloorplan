@@ -1,21 +1,25 @@
+from io import BytesIO
 from pathlib import Path
 from subprocess import run
 from sys import argv
+from typing import IO
 
 import numpy as np
 import PIL
 import PIL.Image
 
+from .config import DELETE_BITMAPS, OUTPUT_FOLDER
 
-def main(filename: str):
-    input = Path(filename)
-    output_dir = Path("output")
-    output_dir.mkdir(parents=True, exist_ok=True)
+
+def convert_to_svg(name: str, input: Path | IO[bytes] | BytesIO):
+    print(f"convert_to_svg({name}, {input})")
+
+    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
     input_image = PIL.Image.open(input).convert("RGB")
     pixels = np.array(input_image)
 
-    output = output_dir / input.stem
+    output = OUTPUT_FOLDER / name
     threshold = 200
 
     for component, colors in [
@@ -46,8 +50,10 @@ def main(filename: str):
         run(["vendor/potrace/potrace", "-b", "svg", intermediate, "-o", intermediate.with_suffix(".svg")], check=True)
 
         # Delete the intermediate file
-        intermediate.unlink()
+        if DELETE_BITMAPS:
+            intermediate.unlink()
 
 
 if __name__ == "__main__":
-    main(argv[1])
+    input = Path(argv[1])
+    convert_to_svg(input.name.split(".")[0], input)
