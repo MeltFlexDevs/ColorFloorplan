@@ -5,7 +5,6 @@ from sys import argv
 import numpy as np
 import PIL
 import PIL.Image
-import PIL.ImageFilter
 
 
 def main(filename: str):
@@ -17,7 +16,7 @@ def main(filename: str):
     pixels = np.array(input_image)
 
     output = output_dir / input.stem
-    threshold = 127
+    threshold = 200
 
     for component, colors in [
         ("windows", [np.array([255, 0, 0])]),
