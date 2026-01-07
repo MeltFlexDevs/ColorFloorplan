@@ -24,6 +24,59 @@ class MeshBuilder:
         self.counters: dict[str, int] = {}
         pass
 
+    def add_quad(self, a, b, c, d, invert_normals=False):
+        i = len(self.vertex_stack)
+        if invert_normals:
+            self.index_stack.extend([i + 0, i + 3, i + 2, i + 2, i + 1, i + 0])
+        else:
+            self.index_stack.extend([i + 0, i + 1, i + 2, i + 2, i + 3, i + 0])
+        self.vertex_stack.extend([a, b, c, d])
+
+    def extrude_shape(self, indices, vertices, height: float = 0, offset: float = 0):
+        if height == 0:
+            # If the height is zero, the result is a floor
+            self.add_mesh_segment(indices[::-1], np.insert(vertices, 1, offset, axis=1))
+            return
+
+        # Bottom
+        self.add_mesh_segment(indices, np.insert(vertices, 1, offset, axis=1))
+        # Top
+        self.add_mesh_segment(indices[::-1], np.insert(vertices, 1, offset + height, axis=1))
+        # Walls; we need to find all exterior edges, to do this, find all edges that are only used
+        # by one triangle in the input. Because the edges are sorted for lookup, also maintain a
+        # dict for the original edge order
+        edge_usage_count: dict[tuple[int, int], int] = {}
+        actual_edges: dict[tuple[int, int], tuple[int, int]] = {}
+
+        for i in range(0, len(indices), 3):
+            triangle = (indices[i], indices[i + 1], indices[i + 2])
+
+            for edge in [(triangle[0], triangle[1]), (triangle[1], triangle[2]), (triangle[2], triangle[0])]:
+                # Sort to count occurrences regardless of direction
+                sorted_edge = tuple(sorted(edge))
+                edge_usage_count[sorted_edge] = edge_usage_count.get(sorted_edge, 0) + 1
+                actual_edges[sorted_edge] = edge
+
+        for edge in edge_usage_count.keys():
+            count = edge_usage_count[edge]
+            if count != 1:
+                continue
+
+            actual_edge = actual_edges[edge]
+            a = vertices[actual_edge[1]]
+            b = vertices[actual_edge[0]]
+            self.add_quad(
+                [a[0], offset, a[1]],
+                [b[0], offset, b[1]],
+                [b[0], offset + height, b[1]],
+                [a[0], offset + height, a[1]],
+            )
+
+    def add_mesh_segment(self, indices, vertices):
+        offset = len(self.vertex_stack)
+        self.vertex_stack.extend(vertices)
+        self.index_stack.extend(np.add(indices, offset))
+
     def resolve_name_with_counter(self, name: str):
         if not name.endswith("_"):
             return name
@@ -33,6 +86,14 @@ class MeshBuilder:
         return f"{name}{count}"
 
     def create_mesh(self, name: str | list[str], indices, vertices, invert_normals=False):
+        if indices is None:
+            indices = self.index_stack
+            self.index_stack = []
+
+        if vertices is None:
+            vertices = self.vertex_stack
+            self.vertex_stack = []
+
         if type(name) == str:
             name = self.resolve_name_with_counter(name)
             names = [name]

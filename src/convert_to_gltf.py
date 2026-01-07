@@ -4,7 +4,7 @@ from sys import argv
 
 import numpy as np
 from mapbox_earcut import triangulate_float32
-from shapely import GeometryCollection, box, buffer, difference, union_all
+from shapely import GeometryCollection, Point, box, buffer, difference, oriented_envelope, union_all
 from shapely.affinity import scale
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
@@ -140,23 +140,51 @@ def build_shape(name: str, merged: "list[Polygon]"):
 
         indices = triangulate_float32(vertices, np.concat([ring_indices, [np.uint32(len(vertices))]], dtype=np.uint32))
 
-        vertices = np.insert(vertices, 1, 0, axis=1)
-
         final_vertices.extend(vertices)
         final_indices.extend(indices + v_offset)
         v_offset += len(vertices)
 
-    builder.create_mesh(f"{name}_", final_indices, final_vertices, invert_normals=True)
+    final_vertices = np.array(final_vertices)
+    height = 2.6
+
+    if name == "room":
+        builder.create_mesh(["Floor_", "Room_"], final_indices, np.insert(final_vertices, 1, 0, axis=1), invert_normals=True)
+        return
+
+    if name == "windows":
+        builder.extrude_shape(final_indices, final_vertices, height=height / 3)
+        builder.extrude_shape(final_indices, final_vertices, height=height / 3, offset=height * 2 / 3)
+        builder.create_mesh("Window_", None, None)
+        return
+
+    if name == "doors":
+        name = "Door"
+        builder.extrude_shape(final_indices, final_vertices, height=height * 10 / 13)
+        builder.create_mesh("Door_", None, None)
+        builder.extrude_shape(final_indices, final_vertices, height=height * 3 / 13, offset=height * 10 / 13)
+        builder.create_mesh("DoorTop_", None, None)
+        return
+
+    if name == "walls":
+        name = "Wall"
+        builder.extrude_shape(final_indices, final_vertices, height=height)
+        builder.create_mesh("Wall_", None, None)
+        return
+
+    assert False
 
 
 @dataclass
 class Shape:
     kind: str
-    value: list[Polygon]
+    polygons: list[Polygon]
+
+
+simplification_tolerance = 0.01
 
 
 def simplify_polygon(polygon: Polygon):
-    polygon = polygon.simplify(tolerance=0.05)  # pyright: ignore[reportAssignmentType]
+    polygon = polygon.simplify(tolerance=simplification_tolerance)  # pyright: ignore[reportAssignmentType]
     return polygon
 
 
@@ -170,24 +198,39 @@ if __name__ == "__main__":
         for shape in load_shapes(f"output/{name}.{component}.svg"):
             all_shapes.append(Shape(component, list(shape)))
 
-    # Calculate normalization factor
-    all_polygons = list(chain.from_iterable(shape.value for shape in all_shapes))
-    representative_width = sum((2 * wall.area) / wall.length for wall in all_polygons) / len(all_polygons)
-    print(f"Wall thickness: {representative_width}")
-    normalizer = 1 / representative_width
+    # Calculate average door width in pixels
+    door_average_sum = 0
+    door_average_count = 0
+    for shape in all_shapes:
+        if shape.kind != "doors":
+            continue
+
+        for polygon in shape.polygons:
+            envelope = oriented_envelope(polygon)
+            assert isinstance(envelope, Polygon)
+
+            x, y = envelope.exterior.coords.xy
+            side1 = Point(x[0], y[0]).distance(Point(x[1], y[1]))
+            side2 = Point(x[1], y[1]).distance(Point(x[2], y[2]))
+            width = max(side1, side2)
+
+            door_average_sum += width
+            door_average_count += 1
+
+    # The average door with is 0.8m, normalize the floorplan so this is true
+    average_door = door_average_sum / door_average_count
+    normalizer = 1 / (average_door / 0.8)
 
     # Normalize and simplify
     for shape in all_shapes:
-        shape.value = [simplify_polygon(scale(polygon, xfact=normalizer, yfact=normalizer, origin=(0, 0))) for polygon in shape.value]
+        shape.polygons = [simplify_polygon(scale(polygon, xfact=normalizer, yfact=normalizer, origin=(0, 0))) for polygon in shape.polygons]
 
     # Build wall geometry
     for shape in all_shapes:
-        build_shape(shape.kind, shape.value)
-
-    # Need to recalculate, scale operation does not mutate
-    all_polygons = list(chain.from_iterable(shape.value for shape in all_shapes))
+        build_shape(shape.kind, shape.polygons)
 
     # Combine all walls for cutting out room shapes
+    all_polygons = list(chain.from_iterable(shape.polygons for shape in all_shapes))
     walls_shape = union_all(all_polygons)
     walls_shape = buffer(walls_shape, 10 * normalizer)
     # Join nearby walls together to fix gaps
@@ -195,7 +238,7 @@ if __name__ == "__main__":
     walls_shape = buffer(walls_shape, -30 * normalizer)
     # Get floor polygons
     background = box(*walls_shape.bounds)
-    rooms_shape = difference(background, walls_shape).simplify(tolerance=0.05)
+    rooms_shape = difference(background, walls_shape).simplify(tolerance=simplification_tolerance)
     rooms = get_shapes_in_geometry(rooms_shape)
 
     # Get all space that is inside the walls
@@ -208,7 +251,7 @@ if __name__ == "__main__":
 
     # Build floor meshes
     for room in rooms:
-        build_shape("room", [room])
+        build_shape("room", [buffer(room, 15 * normalizer)])
 
     gltf = builder.build()
     with open(f"output/{name}.glb", "wb") as file:
