@@ -3,14 +3,18 @@ from pathlib import Path
 from sys import argv
 from typing import IO
 
-from .config import OUTPUT_FOLDER
+from .config import DEBUG_OUTPUT, OUTPUT_FOLDER
 from .convert_to_gltf import convert_to_gltf
 from .convert_to_svg import convert_to_svg
 
 
 def process_input(name: str, input: Path | IO[bytes] | BytesIO):
-    convert_to_svg(name, input)
-    return convert_to_gltf(name)
+    try:
+        convert_to_svg(name, input)
+        return convert_to_gltf(name)
+    finally:
+        if DEBUG_OUTPUT:
+            (OUTPUT_FOLDER / f"{name}.js").write_text(DEBUG_OUTPUT.build())
 
 
 if __name__ == "__main__":

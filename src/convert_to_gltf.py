@@ -1,16 +1,17 @@
 from dataclasses import dataclass
+from functools import cached_property
 from itertools import chain
 from sys import argv
 
 import numpy as np
 from mapbox_earcut import triangulate_float32
-from shapely import GeometryCollection, Point, box, buffer, difference, oriented_envelope, union_all
+from shapely import GeometryCollection, LineString, MultiPoint, Point, box, buffer, difference, oriented_envelope, union_all
 from shapely.affinity import scale
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 from svgpathtools import svg2paths
 
-from .config import DELETE_SVG, OUTPUT_FOLDER
+from .config import DEBUG_ALL_SHAPES, DEBUG_OUTPUT, DELETE_SVG, OUTPUT_FOLDER
 from .MeshBuilder import MeshBuilder
 
 
@@ -114,6 +115,9 @@ def svg_to_triangles_with_holes(file_path, name: str, builder: MeshBuilder):
         counter += 1
 
 
+debug_shape_counter = 0
+
+
 def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
     final_vertices = []
     final_indices = []
@@ -148,6 +152,12 @@ def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
 
     final_vertices = np.array(final_vertices)
     height = 2.6
+
+    if DEBUG_OUTPUT and DEBUG_ALL_SHAPES:
+        for polygon in merged:
+            global debug_shape_counter
+            DEBUG_OUTPUT.print(polygon, label=f"{debug_shape_counter}", stroke="#999999", labelColor="#999999")
+            debug_shape_counter += 1
 
     if name == "room":
         builder.create_mesh(["Floor_", "Room_"], final_indices, np.insert(final_vertices, 1, 0, axis=1), invert_normals=True)
@@ -185,8 +195,186 @@ class Shape:
 simplification_tolerance = 0.01
 
 
-def simplify_polygon(polygon: Polygon):
+@dataclass(eq=False)
+class Rectangle:
+    shape: Shape
+    center: np.ndarray
+    i: np.ndarray
+    j: np.ndarray
+
+    merged = False
+
+    @cached_property
+    def attachment_points(self):
+        return [
+            self.center + self.j,
+            self.center - self.j,
+        ]
+
+
+def raycast(target: BaseGeometry, origin: np.ndarray, direction: np.ndarray, max_distance: float | np.floating):
+    ray = LineString([origin, Point(origin + direction * max_distance)])
+    hit_point = target.intersection(ray)
+    if isinstance(hit_point, MultiPoint):
+        return min(hit_point.geoms, key=lambda v: np.linalg.norm(origin - v.coords[0]))
+    elif isinstance(hit_point, Point):
+        return hit_point
+
+    # There is either not hit or we are inside the target boundary which should also be considered a miss
+    return None
+
+
+def extend_doors_and_windows_to_touch_walls(shapes: list[Shape]):
+    # Doors and windows are expected to be rectangular in shape, so reduce them to their oriented
+    # envelope (a rectangle). This will simplify their model, but more importantly, we can easily
+    # get their axes. This will allow us to extend them to touch their surrounding walls. Some
+    # windows/walls should be touching other windows/walls.
+
+    rects: list[Rectangle] = []
+    walls: list[Shape] = []
+
+    for shape in shapes:
+        if shape.kind == "walls":
+            walls.append(shape)
+            continue
+
+        for polygon in shape.polygons:
+            envelope = polygon.oriented_envelope
+            assert isinstance(envelope, Polygon)
+            coords = np.array(envelope.exterior.coords)
+
+            i = (coords[0] - coords[1]) * 0.5
+            j = (coords[1] - coords[2]) * 0.5
+
+            center = coords[1] + i - j
+
+            if np.linalg.norm(i) > np.linalg.norm(j):
+                i, j = j, i
+
+            rects.append(Rectangle(shape, center, i, j))
+
+            if DEBUG_OUTPUT:
+                DEBUG_OUTPUT.print(envelope, "black")
+                DEBUG_OUTPUT.print(Point(center), "green")
+                DEBUG_OUTPUT.print(Point(center + i), "blue")
+                DEBUG_OUTPUT.print(Point(center + j), "red")
+
+    # Merge all windows/wall that are next to each other
+    i = 0
+    while i < len(rects):
+        first = rects[i]
+        replaced = False
+
+        for ii in range(i + 1, len(rects)):
+            second = rects[ii]
+
+            for attachment_a in first.attachment_points:
+                for attachment_b in second.attachment_points:
+                    distance = np.linalg.norm(attachment_a - attachment_b)
+                    if distance > 0.15:
+                        continue
+
+                    # Reflect the attachment points to get the endpoints of the new rectangle
+                    end_a = 2 * first.center - attachment_a
+                    end_b = 2 * second.center - attachment_b
+                    new_center = (end_a + end_b) * 0.5
+                    new_j = (end_a - end_b) * 0.5
+                    new_rect = Rectangle(first.shape, new_center, first.i, new_j)
+
+                    rects[i] = new_rect
+                    rects.pop(ii)
+                    replaced = True
+                    print(f"Replaced {i} + {ii}")
+                    break
+                if replaced:
+                    break
+            if replaced:
+                break
+
+        if replaced:
+            continue
+
+        i += 1
+
+    # Get the combined boundaries of all walls for raycasting
+    walls_boundary = union_all(list(chain.from_iterable(wall.polygons for wall in walls))).boundary
+    if DEBUG_OUTPUT:
+        DEBUG_OUTPUT.print(walls_boundary, "#00000055")
+    max_distance = 0.15
+
+    # Extend all windows/doors to touch their nearest wall, for each side of the window/door, cast
+    # three rays (left, center, right) to determine the distance we can extend the aforementioned to
+    # make contact with a wall.
+    for rectangle in rects:
+        ends: list[np.ndarray] = []
+        center = rectangle.center
+        i = rectangle.i * 0.9
+        j = rectangle.j
+        j_size = np.linalg.norm(j)
+        j_norm = j / j_size
+
+        for j_direction in [1, -1]:
+            hits: list[np.floating] = []
+            vector = j_norm * j_direction
+
+            for i_direction in [1, -1, 0]:
+                side_origin = center + i * i_direction
+                origin = side_origin + j * j_direction
+
+                hit_point = raycast(walls_boundary, origin, vector, max_distance)
+                if hit_point is None:
+                    continue
+
+                distance = np.linalg.norm(hit_point.coords[0] - side_origin) - j_size
+                if DEBUG_OUTPUT:
+                    DEBUG_OUTPUT.print(Point(origin), "orange")
+                    DEBUG_OUTPUT.print(LineString([origin, hit_point]), "orange")
+
+                hits.append(distance)
+
+            if len(hits) == 0:
+                ends.append(center + j * j_direction)
+                continue
+
+            max_dist = max(hits)
+            min_dist = min(hits)
+
+            hit_distance = min(max_dist, min_dist * 2)
+            ends.append(center + j_norm * (hit_distance + j_size) * j_direction)
+
+        end_a, end_b = ends
+        rectangle.center = (end_a + end_b) * 0.5
+        rectangle.j = (end_a - end_b) * 0.5
+
+    # Replace the shapes with modified ones. Since we don't change walls, keep them as is.
+    shapes.clear()
+    shapes.extend(walls)
+    for rectangle in rects:
+        center = rectangle.center
+        i = rectangle.i
+        j = rectangle.j
+
+        polygon = Polygon(
+            [
+                center + i + j,
+                center + i - j,
+                center - i - j,
+                center - i + j,
+            ]
+        )
+
+        if DEBUG_OUTPUT:
+            DEBUG_OUTPUT.print(polygon, "green")
+
+        shapes.append(Shape(rectangle.shape.kind, [polygon]))
+
+
+def simplify_polygon(polygon: Polygon, kind: str):
+    # Walls are very complex, and we need to preserve their shapes, but the SVG path to vertex
+    # conversion often creates too many vertices on curves, so simplify them to optimize the
+    # resulting model
     polygon = polygon.simplify(tolerance=simplification_tolerance)  # pyright: ignore[reportAssignmentType]
+
     return polygon
 
 
@@ -230,7 +418,9 @@ def convert_to_gltf(name: str):
 
     # Normalize and simplify
     for shape in all_shapes:
-        shape.polygons = [simplify_polygon(scale(polygon, xfact=normalizer, yfact=normalizer, origin=(0, 0))) for polygon in shape.polygons]
+        shape.polygons = [simplify_polygon(scale(polygon, xfact=normalizer, yfact=normalizer, origin=(0, 0)), kind=shape.kind) for polygon in shape.polygons]
+
+    extend_doors_and_windows_to_touch_walls(all_shapes)
 
     # Build wall geometry
     for shape in all_shapes:
@@ -241,8 +431,8 @@ def convert_to_gltf(name: str):
     walls_shape = union_all(all_polygons)
     walls_shape = buffer(walls_shape, 10 * normalizer)
     # Join nearby walls together to fix gaps
-    walls_shape = buffer(walls_shape, 30 * normalizer)
-    walls_shape = buffer(walls_shape, -30 * normalizer)
+    walls_shape = buffer(walls_shape, 10 * normalizer)
+    walls_shape = buffer(walls_shape, -10 * normalizer)
     # Get floor polygons
     background = box(*walls_shape.bounds)
     rooms_shape = difference(background, walls_shape).simplify(tolerance=simplification_tolerance)
@@ -266,7 +456,12 @@ def convert_to_gltf(name: str):
 
 if __name__ == "__main__":
     name = argv[1]
-    gltf = convert_to_gltf(name)
 
-    with open(OUTPUT_FOLDER / f"{name}.glb", "wb") as file:
-        gltf.write_glb(file, save_file_resources=False)
+    try:
+        gltf = convert_to_gltf(name)
+
+        with open(OUTPUT_FOLDER / f"{name}.glb", "wb") as file:
+            gltf.write_glb(file, save_file_resources=False)
+    finally:
+        if DEBUG_OUTPUT:
+            (OUTPUT_FOLDER / f"{name}.js").write_text(DEBUG_OUTPUT.build())
