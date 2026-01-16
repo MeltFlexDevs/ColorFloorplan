@@ -1,6 +1,6 @@
+import subprocess
 from io import BytesIO
 from pathlib import Path
-from subprocess import run
 from sys import argv
 from typing import IO
 
@@ -22,23 +22,20 @@ def convert_to_svg(name: str, input: Path | IO[bytes] | BytesIO):
     output = OUTPUT_FOLDER / name
     threshold = 200
 
-    for component, colors in [
-        ("windows", [np.array([255, 0, 0])]),
-        ("doors", [np.array([0, 255, 0])]),
-        ("walls", [np.array([0, 0, 255])]),
+    processes: list[subprocess.Popen] = []
+    intermediates: list[Path] = []
+
+    for component, color in [
+        ("windows", np.array([255, 0, 0])),
+        ("doors", np.array([0, 255, 0])),
+        ("walls", np.array([0, 0, 255])),
+        ("balcony", np.array([255, 255, 0])),
     ]:
-        # Get pixels of the required colors
-        combined_matches = np.zeros(pixels.shape[:2], dtype=bool)
-
-        for color in colors:
-            # Calculate distance for this specific color
-            distances = np.linalg.norm(pixels - color, axis=2)
-
-            # Combine with previous matches using logical OR (at least one match)
-            combined_matches = np.logical_or(combined_matches, distances < threshold)
+        # Get pixels matching the required colors
+        distances = np.linalg.norm(pixels - color, axis=2)
 
         # Convert boolean mask to 0/255 uint8 format
-        matches = np.where(combined_matches, 0, 255).astype(np.uint8)
+        matches = np.where(distances < threshold, 0, 255).astype(np.uint8)
 
         # Save the intermediate image
         grayscale = np.repeat(matches[:, :, np.newaxis], 3, axis=2)
@@ -47,10 +44,18 @@ def convert_to_svg(name: str, input: Path | IO[bytes] | BytesIO):
         output_image.save(intermediate)
 
         # Convert to SVG
-        run(["vendor/potrace/potrace", "-b", "svg", intermediate, "-o", intermediate.with_suffix(".svg")], check=True)
+        process = subprocess.Popen(["vendor/potrace/potrace", "-b", "svg", intermediate, "-o", intermediate.with_suffix(".svg")])
+        processes.append(process)
+        intermediates.append(intermediate)
 
-        # Delete the intermediate file
-        if DELETE_BITMAPS:
+    # Wait for child processes to exit
+    for process in processes:
+        code = process.wait()
+        assert code == 0
+
+    # Delete the intermediate file
+    if DELETE_BITMAPS:
+        for intermediate in intermediates:
             intermediate.unlink()
 
 

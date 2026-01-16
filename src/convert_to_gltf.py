@@ -169,6 +169,11 @@ def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
         builder.create_mesh("Window_", None, None)
         return
 
+    if name == "balcony":
+        builder.extrude_shape(final_indices, final_vertices, height=height / 3)
+        builder.create_mesh("Fence_", None, None)
+        return
+
     if name == "doors":
         name = "Door"
         builder.extrude_shape(final_indices, final_vertices, height=height * 10 / 13)
@@ -228,13 +233,13 @@ def extend_doors_and_windows_to_touch_walls(shapes: list[Shape]):
     # Doors and windows are expected to be rectangular in shape, so reduce them to their oriented
     # envelope (a rectangle). This will simplify their model, but more importantly, we can easily
     # get their axes. This will allow us to extend them to touch their surrounding walls. Some
-    # windows/walls should be touching other windows/walls.
+    # windows/doors should be touching other windows/doors.
 
     rects: list[Rectangle] = []
     walls: list[Shape] = []
 
     for shape in shapes:
-        if shape.kind == "walls":
+        if shape.kind != "windows" and shape.kind != "doors":
             walls.append(shape)
             continue
 
@@ -384,11 +389,20 @@ def convert_to_gltf(name: str):
 
     all_shapes: list[Shape] = []
 
-    for component in ["windows", "walls", "doors"]:
+    for component in ["windows", "walls", "doors", "balcony"]:
         filename = OUTPUT_FOLDER / f"{name}.{component}.svg"
 
-        for shape in load_shapes(filename):
-            all_shapes.append(Shape(component, list(shape)))
+        for shape_polygons in load_shapes(filename):
+            # Create a shape from the polygons parsed from the SVG path. The path may be degenerate
+            # (a line) due to antialiasing pixels being detected as the correct color, ignore all
+            # lines by calculating the polygon thickness (expected thickness for good polygons is in
+            # the range 30..70, but all degenerate polygons are 1..4).
+            shape = Shape(component, list(polygon for polygon in shape_polygons if polygon.area / polygon.exterior.length > 5))
+
+            if len(shape.polygons) == 0:
+                continue
+
+            all_shapes.append(shape)
 
         if DELETE_SVG:
             filename.unlink()

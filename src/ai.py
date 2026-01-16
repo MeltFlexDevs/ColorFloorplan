@@ -6,38 +6,31 @@ from time import strftime
 from google import genai
 from google.oauth2 import service_account
 
-prompt = """Clean this architectural floorplan for 1:1 conversion.
-
-REFERENCE IMAGE (first image): Shows EXACT symbols for doors and windows. Detect these precisely:
-- Door: Wall opening + quarter-circle arc
-- Window: 3 parallel lines in wall
-
-EXAMPLE OUTPUT (second image): Shows the REQUIRED style of the output image
-- The OUTPUT style must match EXAMPLE OUTPUT (second image) image.
-- The EXAMPLE should only be used for determining the style, the layout of the output floorplan MUST be according to the INPUT IMAGE
-
-INPUT IMAGE (third image):
-- This is the floorplan, based on which the layout of the OUTPUT image should be determined
-- The layout (positions and shapes of walls, doors and windows) of the output floorplan MUST be according to the INPUT IMAGE
-
-CRITICAL - PRESERVE PROPORTIONS:
-- Keep exact aspect ratio and dimensions of floorplan
-- Maintain precise room sizes and relationships
-
-REMOVE:
-- Balconies (replace with solid wall - completely closed, no openings)
-- Furniture, appliances, decorations
-- Text, labels, dimensions, annotations
-- Textures, patterns, symbols
-
-Transform (using reference symbols):
-- Walls: Solid blue color
-- Doors: Solid green color rectangles
-- Windows: Solid red color rectangles
-
-The OUTPUT style must match EXAMPLE OUTPUT (second image) image.
-
-OUTPUT: Clean drawing on white background with walls filled solid blue, doors with solid green, windows with solid red, exact proportions preserved."""
+prompt = """You are an expert in TRANSFORMING IMAGES, YOU TRANSFORM FIRST IMAGE INTO A CLEAN FLOORPLAN DRAWING.
+ 
+⚠️ CRITICAL: The FIRST IMAGE (immediately after this text) is YOUR INPUT. Transform ONLY this image.
+The other image is just reference examples - DO NOT copy or return them.
+ 
+YOUR TASK:
+Look at the FIRST IMAGE - this is the floorplan you must transform
+Trace its walls, doors, balcony railing, and windows
+Apply these colors: walls=BLUE, balcony railing=YELLOW, doors=GREEN only one solid rectangle for one door (represents closed doors), windows=RED one window = one solid rectangle
+Keep the EXACT same room layout, proportions, and structure as the FIRST IMAGE
+ 
+REMOVE from output:
+All furniture, appliances, text, labels, dimensions, and annotations
+whole door arcs that show door swings
+ 
+OUTPUT REQUIREMENTS:
+White background
+Walls: solid blue fill (thick line)
+Balcony railings: solid yellow rectangle (thick line)
+Doors: solid green rectangle (thick line)
+Windows: solid red rectangle (thick line)
+ 
+The second image shows the color style and shape to use on doors (no arcs, just one thick line connected to walls), walls, balcony railings, and windows (reference only - DO NOT return this image).
+ 
+VERIFY BEFORE GENERATING: Your output MUST match the room layout of the FIRST IMAGE, not any reference image, and must be closed from outside, THERE CANNOT BE ANY GAPS. And door must be solid rectangle with both ends connected to walls, as u can see it on the reference image - this is very IMPORTANT, often time you fail to do this. Make it exactly like i told you, this is VERY IMPORTANT for me, it can save my life."""
 
 
 def main(filename: str):
@@ -65,9 +58,8 @@ def main(filename: str):
                 role="user",
                 parts=[
                     genai.types.Part(text=prompt),
-                    genai.types.Part.from_bytes(mime_type="image/png", data=Path("reference.png").read_bytes()),
-                    genai.types.Part.from_bytes(mime_type="image/png", data=Path("example.png").read_bytes()),
                     input_image,
+                    genai.types.Part.from_bytes(mime_type="image/png", data=Path("example.png").read_bytes()),
                 ],
             ),
             config=genai.types.GenerateContentConfig(
