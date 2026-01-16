@@ -7,29 +7,29 @@ from google import genai
 from google.oauth2 import service_account
 
 prompt = """You are an expert in TRANSFORMING IMAGES, YOU TRANSFORM FIRST IMAGE INTO A CLEAN FLOORPLAN DRAWING.
- 
+
 ⚠️ CRITICAL: The FIRST IMAGE (immediately after this text) is YOUR INPUT. Transform ONLY this image.
 The other image is just reference examples - DO NOT copy or return them.
- 
+
 YOUR TASK:
-Look at the FIRST IMAGE - this is the floorplan you must transform
-Trace its walls, doors, balcony railing, and windows
-Apply these colors: walls=BLUE, balcony railing=YELLOW, doors=GREEN only one solid rectangle for one door (represents closed doors), windows=RED one window = one solid rectangle
-Keep the EXACT same room layout, proportions, and structure as the FIRST IMAGE
- 
+1. Look at the FIRST IMAGE - this is the floorplan you must transform
+2. Trace its walls, doors, balcony railing, and windows
+3. Apply these colors: walls=BLUE, balcony railing=YELLOW, doors=GREEN only one solid rectangle for one door (represents closed doors), windows=RED one window = one solid rectangle
+4. Keep the EXACT same room layout, proportions, and structure as the FIRST IMAGE
+
 REMOVE from output:
-All furniture, appliances, text, labels, dimensions, and annotations
-whole door arcs that show door swings
- 
+- All furniture, appliances, text, labels, dimensions, and annotations
+- whole door arcs that show door swings
+
 OUTPUT REQUIREMENTS:
-White background
-Walls: solid blue fill (thick line)
-Balcony railings: solid yellow rectangle (thick line)
-Doors: solid green rectangle (thick line)
-Windows: solid red rectangle (thick line)
- 
+- White background
+- Walls: solid blue fill (thick line)
+- Balcony railings: solid yellow rectangle (thick line)
+- Doors: solid green rectangle (thick line)
+- Windows: solid red rectangle (thick line)
+
 The second image shows the color style and shape to use on doors (no arcs, just one thick line connected to walls), walls, balcony railings, and windows (reference only - DO NOT return this image).
- 
+
 VERIFY BEFORE GENERATING: Your output MUST match the room layout of the FIRST IMAGE, not any reference image, and must be closed from outside, THERE CANNOT BE ANY GAPS. And door must be solid rectangle with both ends connected to walls, as u can see it on the reference image - this is very IMPORTANT, often time you fail to do this. Make it exactly like i told you, this is VERY IMPORTANT for me, it can save my life."""
 
 
