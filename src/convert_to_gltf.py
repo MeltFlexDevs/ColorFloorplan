@@ -6,12 +6,13 @@ from sys import argv
 import numpy as np
 from mapbox_earcut import triangulate_float32
 from shapely import GeometryCollection, LineString, MultiPoint, Point, box, buffer, difference, oriented_envelope, union_all
-from shapely.affinity import scale
+from shapely.affinity import affine_transform, scale
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import nearest_points
 from svgpathtools import svg2paths
 
-from .config import DEBUG_ALL_SHAPES, DEBUG_OUTPUT, DELETE_SVG, OUTPUT_FOLDER
+from .config import DEBUG_ALL_SHAPES, DEBUG_DOOR_FIX, DEBUG_EXTENDING_OBJECTS, DEBUG_OUTPUT, DELETE_SVG, OUTPUT_FOLDER
 from .MeshBuilder import MeshBuilder
 
 
@@ -229,6 +230,36 @@ def raycast(target: BaseGeometry, origin: np.ndarray, direction: np.ndarray, max
     return None
 
 
+def get_rectangle_from_envelope(envelope: Polygon):
+    coords = np.array(envelope.exterior.coords)
+
+    i: np.ndarray = (coords[0] - coords[1]) * 0.5
+    j: np.ndarray = (coords[1] - coords[2]) * 0.5
+
+    center: np.ndarray = coords[1] + i - j
+    return i, j, center
+
+
+def mirror_by_line[T: BaseGeometry](geom: T, point, direction) -> T:
+    x0, y0 = point
+    dx, dy = direction
+
+    # Normalize the direction vector
+    mag = np.sqrt(dx**2 + dy**2)
+    dx, dy = dx / mag, dy / mag
+
+    # Calculate matrix coefficients
+    a = dx**2 - dy**2
+    b = 2 * dx * dy
+    d = 2 * dx * dy
+    e = dy**2 - dx**2
+
+    xoff = 2 * dy * (x0 * dy - y0 * dx)
+    yoff = 2 * dx * (y0 * dx - x0 * dy)
+
+    return affine_transform(geom, [a, b, d, e, xoff, yoff])
+
+
 def extend_doors_and_windows_to_touch_walls(shapes: list[Shape]):
     # Doors and windows are expected to be rectangular in shape, so reduce them to their oriented
     # envelope (a rectangle). This will simplify their model, but more importantly, we can easily
@@ -236,29 +267,84 @@ def extend_doors_and_windows_to_touch_walls(shapes: list[Shape]):
     # windows/doors should be touching other windows/doors.
 
     rects: list[Rectangle] = []
-    walls: list[Shape] = []
+
+    # Get the combined boundaries of all walls for raycasting
+    walls = [shape for shape in shapes if shape.kind == "walls" or shape.kind == "balcony"]
+    walls_geometry = union_all(list(chain.from_iterable(wall.polygons for wall in walls)))
+    walls_boundary = walls_geometry.boundary
+    if DEBUG_OUTPUT and DEBUG_EXTENDING_OBJECTS:
+        DEBUG_OUTPUT.print(walls_boundary, "#00000055")
+    max_distance = 0.15
 
     for shape in shapes:
         if shape.kind != "windows" and shape.kind != "doors":
-            walls.append(shape)
             continue
 
         for polygon in shape.polygons:
             envelope = polygon.oriented_envelope
             assert isinstance(envelope, Polygon)
-            coords = np.array(envelope.exterior.coords)
 
-            i = (coords[0] - coords[1]) * 0.5
-            j = (coords[1] - coords[2]) * 0.5
+            if envelope.area / polygon.area >= 1.1:
+                # This polygon was generated from a door that the AI has incorrectly transformed
+                # from the input image. In this case, the shape is of the door in the wall plus the
+                # arc that marks where the door will open. We need to extract only the base part of
+                # the polygon.
+                base_marker = polygon.buffer(0.05).intersection(walls_geometry).oriented_envelope
 
-            center = coords[1] + i - j
+                if DEBUG_OUTPUT and DEBUG_DOOR_FIX:
+                    DEBUG_OUTPUT.print(polygon, "red")
+                    DEBUG_OUTPUT.print(base_marker, "blue")
+
+                new_polygon = base_marker.intersection(polygon)
+                if new_polygon.area == 0:
+                    # There is only one wall touching the door, we need to mirror the base marker on
+                    # the other side of the door to get the base. We need to determine the axis by
+                    # which to mirror and then mirror.
+                    i, j, center = get_rectangle_from_envelope(envelope)
+
+                    # Determine the axis for mirroring by finding which side of the rectangle
+                    # envelope the base is.
+
+                    # 1. Find the point nearest to the base and the center that is inside the envelope.
+                    alignment_point = nearest_points(base_marker, Point(center))[0]
+                    alignment_point = nearest_points(envelope, alignment_point)[0]
+
+                    # 2. Find which side of the envelope the point is by getting the local position inside the envelope.
+                    A = np.array(alignment_point.coords[0])
+                    A_i = np.dot(A, i)
+                    A_j = np.dot(A, j)
+
+                    # 3. The mirror axis is the other one.
+                    if abs(A_i) > abs(A_j):
+                        mirror_axis = j
+                    else:
+                        mirror_axis = i
+
+                    # Mirror (the axis needs to be a normalized vector)
+                    mirrored_base = mirror_by_line(base_marker, center, mirror_axis / np.linalg.norm(mirror_axis))
+                    envelope = GeometryCollection([mirrored_base, base_marker]).oriented_envelope
+
+                    if DEBUG_OUTPUT and DEBUG_DOOR_FIX:
+                        DEBUG_OUTPUT.print(LineString([center - i * 2, center + i * 2]), "green")
+                        DEBUG_OUTPUT.print(LineString([center - j * 2, center + j * 2]), "green")
+                        DEBUG_OUTPUT.print(LineString([center - mirror_axis * 2, center + mirror_axis * 2]), "blue")
+                        DEBUG_OUTPUT.print(mirrored_base, "purple")
+                else:
+                    envelope = new_polygon.oriented_envelope
+
+                assert isinstance(envelope, Polygon)
+
+                if DEBUG_OUTPUT and DEBUG_DOOR_FIX:
+                    DEBUG_OUTPUT.print(envelope, "orange")
+
+            i, j, center = get_rectangle_from_envelope(envelope)
 
             if np.linalg.norm(i) > np.linalg.norm(j):
                 i, j = j, i
 
             rects.append(Rectangle(shape, center, i, j))
 
-            if DEBUG_OUTPUT:
+            if DEBUG_OUTPUT and DEBUG_EXTENDING_OBJECTS:
                 DEBUG_OUTPUT.print(envelope, "black")
                 DEBUG_OUTPUT.print(Point(center), "green")
                 DEBUG_OUTPUT.print(Point(center + i), "blue")
@@ -301,12 +387,6 @@ def extend_doors_and_windows_to_touch_walls(shapes: list[Shape]):
 
         i += 1
 
-    # Get the combined boundaries of all walls for raycasting
-    walls_boundary = union_all(list(chain.from_iterable(wall.polygons for wall in walls))).boundary
-    if DEBUG_OUTPUT:
-        DEBUG_OUTPUT.print(walls_boundary, "#00000055")
-    max_distance = 0.15
-
     # Extend all windows/doors to touch their nearest wall, for each side of the window/door, cast
     # three rays (left, center, right) to determine the distance we can extend the aforementioned to
     # make contact with a wall.
@@ -331,7 +411,7 @@ def extend_doors_and_windows_to_touch_walls(shapes: list[Shape]):
                     continue
 
                 distance = np.linalg.norm(hit_point.coords[0] - side_origin) - j_size
-                if DEBUG_OUTPUT:
+                if DEBUG_OUTPUT and DEBUG_EXTENDING_OBJECTS:
                     DEBUG_OUTPUT.print(Point(origin), "orange")
                     DEBUG_OUTPUT.print(LineString([origin, hit_point]), "orange")
 
@@ -368,7 +448,7 @@ def extend_doors_and_windows_to_touch_walls(shapes: list[Shape]):
             ]
         )
 
-        if DEBUG_OUTPUT:
+        if DEBUG_OUTPUT and DEBUG_EXTENDING_OBJECTS:
             DEBUG_OUTPUT.print(polygon, "green")
 
         shapes.append(Shape(rectangle.shape.kind, [polygon]))

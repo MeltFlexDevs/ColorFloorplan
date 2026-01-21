@@ -1,8 +1,9 @@
 from math import inf
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 from shapely import LineString, MultiLineString, MultiPolygon, Point, Polygon
+from shapely.geometry.base import BaseGeometry
 
 DELETE_BITMAPS = True
 DELETE_SVG = True
@@ -43,7 +44,10 @@ class DebugOutput:
             1 / (self.max_y - self.min_y) if self.max_y != self.min_y else 1,
         )
 
-    def print(self, shape: Any, stroke="#000000", fill="#00ff00", label: str | None = None, labelColor="#ff0000"):
+    def print(self, shape: BaseGeometry, stroke="#000000", fill="#00ff00", label: str | None = None, labelColor="#ff0000"):
+        if shape.is_empty:
+            return
+
         self.strokes.append(lambda: f'drawer.setStyle("{stroke}")')
         self.fills.append(lambda: f'drawer.setStyle(Color.fromHex("{fill}").opacity(0.25))')
 
@@ -111,4 +115,6 @@ class DebugOutput:
 
 
 DEBUG_ALL_SHAPES = False
+DEBUG_EXTENDING_OBJECTS = False
+DEBUG_DOOR_FIX = False
 DEBUG_OUTPUT: DebugOutput | None = None
