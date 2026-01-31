@@ -564,6 +564,34 @@ def group_edges_by_angle(
     ]
 
 
+def get_wall_thickness(polygon: Polygon) -> float:
+    """
+    Estimate wall thickness from polygon geometry.
+    Uses area/perimeter ratio as approximation.
+    """
+    area = polygon.area
+    perimeter = polygon.exterior.length
+    if perimeter == 0:
+        return 0.2
+    # For a long thin rectangle: thickness ≈ 2*area/perimeter
+    estimated = 2 * area / perimeter
+    return max(0.05, min(0.5, estimated))
+
+
+def get_inward_normal(p1: tuple, p2: tuple) -> np.ndarray:
+    """
+    Get the inward-facing normal vector for an edge.
+    For exterior boundary (CCW), inward is to the right of edge direction.
+    """
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    length = np.sqrt(dx*dx + dy*dy)
+    if length == 0:
+        return np.array([0.0, 0.0])
+    # Perpendicular vector (rotated 90° clockwise = inward for CCW polygon)
+    return np.array([dy / length, -dx / length])
+
+
 def build_segmented_walls(
     merged: list[Polygon],
     builder: MeshBuilder,
@@ -573,73 +601,106 @@ def build_segmented_walls(
     """
     Build 3D walls segmented by angle.
 
-    Preserves original wall geometry (exterior + interior boundaries connected
-    via shared floor and ceiling). Only the vertical walls are split into
-    separate meshes based on angle changes.
-
-    Structure:
-    - WallFloor_X: Shared floor for entire wall polygon
-    - WallCeiling_X: Shared ceiling for entire wall polygon
-    - Wall_X: Individual vertical wall segments (split at angle changes)
+    Each Wall_ segment is a complete closed 3D box with:
+    - Outer vertical face
+    - Inner vertical face
+    - Top face (connecting outer and inner)
+    - Bottom face (connecting outer and inner)
     """
     for poly in merged:
-        # --- STEP 1: Triangulate the polygon (with holes) ---
-        v_list = [np.array(poly.exterior.coords)[:-1]]
-        rings = [len(v_list[0])]
+        # Estimate wall thickness for this polygon
+        thickness = get_wall_thickness(poly)
 
-        for hole in poly.interiors:
-            v_list.append(np.array(hole.coords)[:-1])
-            rings.append(len(v_list[-1]))
-
-        vertices = np.vstack(v_list).astype(np.float32)
-
-        if len(rings) > 1:
-            ring_indices = np.cumsum(rings)[:-1].astype(np.uint32)
-        else:
-            ring_indices = np.array([], dtype=np.uint32)
-
-        indices = triangulate_float32(
-            vertices,
-            np.concat([ring_indices, [np.uint32(len(vertices))]], dtype=np.uint32)
-        )
-
-        # --- STEP 2: Create floor (bottom) ---
-        builder.add_mesh_segment(indices, np.insert(vertices, 1, 0, axis=1))
-        builder.create_mesh("WallFloor_", None, None)
-
-        # --- STEP 3: Create ceiling (top) ---
-        builder.add_mesh_segment(indices[::-1], np.insert(vertices, 1, height, axis=1))
-        builder.create_mesh("WallCeiling_", None, None)
-
-        # --- STEP 4: Create segmented vertical walls (exterior) ---
+        # --- Process exterior boundary ---
         exterior_coords = list(poly.exterior.coords)
         groups = group_edges_by_angle(exterior_coords, angle_threshold)
 
         for group in groups:
             for (p1, p2) in group:
-                # Quad for exterior wall (normals facing outward)
+                # Calculate inward offset points
+                normal = get_inward_normal(p1, p2)
+                p1_inner = (p1[0] + normal[0] * thickness, p1[1] + normal[1] * thickness)
+                p2_inner = (p2[0] + normal[0] * thickness, p2[1] + normal[1] * thickness)
+
+                # Outer vertical wall (normals facing outward)
                 builder.add_quad(
                     [p2[0], 0, p2[1]],
                     [p1[0], 0, p1[1]],
                     [p1[0], height, p1[1]],
                     [p2[0], height, p2[1]],
                 )
+
+                # Inner vertical wall (normals facing inward)
+                builder.add_quad(
+                    [p1_inner[0], 0, p1_inner[1]],
+                    [p2_inner[0], 0, p2_inner[1]],
+                    [p2_inner[0], height, p2_inner[1]],
+                    [p1_inner[0], height, p1_inner[1]],
+                )
+
+                # Bottom face (connecting outer and inner)
+                builder.add_quad(
+                    [p1[0], 0, p1[1]],
+                    [p2[0], 0, p2[1]],
+                    [p2_inner[0], 0, p2_inner[1]],
+                    [p1_inner[0], 0, p1_inner[1]],
+                )
+
+                # Top face (connecting outer and inner)
+                builder.add_quad(
+                    [p2[0], height, p2[1]],
+                    [p1[0], height, p1[1]],
+                    [p1_inner[0], height, p1_inner[1]],
+                    [p2_inner[0], height, p2_inner[1]],
+                )
+
             builder.create_mesh("Wall_", None, None)
 
-        # --- STEP 5: Create segmented vertical walls (interior/holes) ---
+        # --- Process interior boundaries (holes) ---
         for hole in poly.interiors:
             hole_coords = list(hole.coords)
             hole_groups = group_edges_by_angle(hole_coords, angle_threshold)
 
             for group in hole_groups:
                 for (p1, p2) in group:
-                    # Quad for interior wall (normals facing inward)
+                    # For holes, inward normal points outward from hole (opposite direction)
+                    normal = get_inward_normal(p1, p2)
+                    # Negate for holes (CW orientation)
+                    p1_outer = (p1[0] - normal[0] * thickness, p1[1] - normal[1] * thickness)
+                    p2_outer = (p2[0] - normal[0] * thickness, p2[1] - normal[1] * thickness)
+
+                    # Inner vertical wall (facing into room)
                     builder.add_quad(
                         [p1[0], 0, p1[1]],
                         [p2[0], 0, p2[1]],
                         [p2[0], height, p2[1]],
                         [p1[0], height, p1[1]],
                     )
+
+                    # Outer vertical wall
+                    builder.add_quad(
+                        [p2_outer[0], 0, p2_outer[1]],
+                        [p1_outer[0], 0, p1_outer[1]],
+                        [p1_outer[0], height, p1_outer[1]],
+                        [p2_outer[0], height, p2_outer[1]],
+                    )
+
+                    # Bottom face
+                    builder.add_quad(
+                        [p2[0], 0, p2[1]],
+                        [p1[0], 0, p1[1]],
+                        [p1_outer[0], 0, p1_outer[1]],
+                        [p2_outer[0], 0, p2_outer[1]],
+                    )
+
+                    # Top face
+                    builder.add_quad(
+                        [p1[0], height, p1[1]],
+                        [p2[0], height, p2[1]],
+                        [p2_outer[0], height, p2_outer[1]],
+                        [p1_outer[0], height, p1_outer[1]],
+                    )
+
                 builder.create_mesh("Wall_", None, None)
 
 
