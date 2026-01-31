@@ -22,20 +22,31 @@ def convert_to_svg(name: str, input: Path | IO[bytes] | BytesIO):
     output = OUTPUT_FOLDER / name
     threshold = 200
 
-    processes: list[subprocess.Popen] = []
-    intermediates: list[Path] = []
-
-    for component, color in [
+    # Define all components and their colors
+    components = [
         ("windows", np.array([255, 0, 0])),
         ("doors", np.array([0, 255, 0])),
         ("walls", np.array([0, 0, 255])),
         ("balcony", np.array([255, 255, 0])),
-    ]:
-        # Get pixels matching the required colors
-        distances = np.linalg.norm(pixels - color, axis=2)
+    ]
 
-        # Convert boolean mask to 0/255 uint8 format
-        matches = np.where(distances < threshold, 0, 255).astype(np.uint8)
+    # Calculate distances for all colors at once
+    all_distances = np.stack([np.linalg.norm(pixels - color, axis=2) for _, color in components], axis=0)
+
+    # Find the closest color for each pixel
+    closest_color_idx = np.argmin(all_distances, axis=0)
+
+    # Get the minimum distance for each pixel
+    min_distances = np.min(all_distances, axis=0)
+
+    processes: list[subprocess.Popen] = []
+    intermediates: list[Path] = []
+
+    for idx, (component, color) in enumerate(components):
+        # Pixel belongs to this component only if:
+        # 1. This is the closest color (exclusive assignment)
+        # 2. The distance is below threshold
+        matches = np.where((closest_color_idx == idx) & (min_distances < threshold), 0, 255).astype(np.uint8)
 
         # Save the intermediate image
         grayscale = np.repeat(matches[:, :, np.newaxis], 3, axis=2)

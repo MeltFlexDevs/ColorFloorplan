@@ -5,7 +5,7 @@ from sys import argv
 
 import numpy as np
 from mapbox_earcut import triangulate_float32
-from shapely import GeometryCollection, LineString, MultiPoint, Point, box, buffer, difference, oriented_envelope, union_all
+from shapely import GeometryCollection, LineString, MultiPoint, Point, box, buffer, difference, oriented_envelope, union_all, make_valid
 from shapely.affinity import affine_transform, scale
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
@@ -61,7 +61,7 @@ def load_shapes(file_path):
 
         # 3. Merge overlapping paths to resolve holes automatically
         # This logic identifies which paths are inside others
-        merged = difference(union_all(outline), union_all(holes))
+        merged = make_valid(difference(make_valid(union_all(outline)), make_valid(union_all(holes))))
         yield get_shapes_in_geometry(merged)
 
 
@@ -73,7 +73,7 @@ def get_shapes_in_geometry(geometry: BaseGeometry):
         return geometry.geoms
     else:
         # Unreachable
-        assert False
+        return []
 
 
 def svg_to_triangles_with_holes(file_path, name: str, builder: MeshBuilder):
@@ -102,7 +102,7 @@ def svg_to_triangles_with_holes(file_path, name: str, builder: MeshBuilder):
 
         # 3. Merge overlapping paths to resolve holes automatically
         # This logic identifies which paths are inside others
-        merged = difference(union_all(outline), union_all(holes))
+        merged = make_valid(difference(make_valid(union_all(outline)), make_valid(union_all(holes))))
 
         # Handle both single Polygons and MultiPolygons (multiple separate objects)
         if isinstance(merged, Polygon):
@@ -111,7 +111,7 @@ def svg_to_triangles_with_holes(file_path, name: str, builder: MeshBuilder):
             merged = merged.geoms
         else:
             # Unreachable
-            assert False
+            return []
 
         counter += 1
 
@@ -189,7 +189,7 @@ def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
         builder.create_mesh("Wall_", None, None)
         return
 
-    assert False
+    return []
 
 
 @dataclass
@@ -219,6 +219,8 @@ class Rectangle:
 
 
 def raycast(target: BaseGeometry, origin: np.ndarray, direction: np.ndarray, max_distance: float | np.floating):
+    if np.allclose(direction, 0) or max_distance <= 0:
+        return None
     ray = LineString([origin, Point(origin + direction * max_distance)])
     hit_point = target.intersection(ray)
     if isinstance(hit_point, MultiPoint):
@@ -507,7 +509,7 @@ def convert_to_gltf(name: str):
             door_average_count += 1
 
     # The average door with is 0.8m, normalize the floorplan so this is true
-    average_door = door_average_sum / door_average_count
+    average_door = door_average_sum / door_average_count if door_average_count > 0 else 80
     normalizer = 1 / (average_door / 0.8)
 
     # Normalize and simplify
