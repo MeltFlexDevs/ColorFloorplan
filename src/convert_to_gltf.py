@@ -14,7 +14,7 @@ from svgpathtools import svg2paths
 
 from .config import DEBUG_ALL_SHAPES, DEBUG_DOOR_FIX, DEBUG_EXTENDING_OBJECTS, DEBUG_OUTPUT, DELETE_SVG, OUTPUT_FOLDER
 from .MeshBuilder import MeshBuilder
-from .wall_segmentation import segment_all_walls, WallSegment
+from .wall_segmentation import build_all_wall_segments
 
 
 def path_to_points(path, distance_step=1.0):
@@ -191,56 +191,6 @@ def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
         return
 
     return []
-
-
-def build_single_wall_segment(segment: WallSegment, builder: MeshBuilder, height: float = 2.6):
-    """
-    Vytvorí 3D mesh pre jeden segment steny.
-    """
-    poly = segment.polygon
-
-    # Priprav vrcholy a indexy
-    v_list = [np.array(poly.exterior.coords)[:-1]]
-    rings = [len(v_list[0])]
-
-    for hole in poly.interiors:
-        v_list.append(np.array(hole.coords)[:-1])
-        rings.append(len(v_list[-1]))
-
-    vertices = np.vstack(v_list).astype(np.float32)
-
-    if len(rings) > 1:
-        ring_indices = np.cumsum(rings)[:-1].astype(np.uint32)
-    else:
-        ring_indices = np.array([], dtype=np.uint32)
-
-    indices = triangulate_float32(vertices, np.concat([ring_indices, [np.uint32(len(vertices))]], dtype=np.uint32))
-
-    # Vytvor mesh s názvom podľa typu segmentu
-    segment_type_prefix = {
-        "straight": "Wall",
-        "angled": "AngledWall",
-        "curved": "CurvedWall"
-    }.get(segment.segment_type, "Wall")
-
-    builder.extrude_shape(list(indices), vertices, height=height)
-    builder.create_mesh(f"{segment_type_prefix}_", None, None)
-
-
-def build_wall_segments(wall_polygons: list[Polygon], builder: MeshBuilder, debug_output=None):
-    """
-    Rozdelí steny na segmenty podľa uhlov a vytvorí samostatné meshe.
-    """
-    # Segmentuj všetky steny
-    segments = segment_all_walls(wall_polygons, debug_output)
-
-    height = 2.6
-
-    # Vytvor mesh pre každý segment
-    for segment in segments:
-        build_single_wall_segment(segment, builder, height)
-
-    return segments
 
 
 @dataclass
@@ -579,7 +529,7 @@ def convert_to_gltf(name: str):
 
     # Segmentuj a postav steny - každý segment je samostatný mesh
     if wall_polygons:
-        build_wall_segments(wall_polygons, builder, DEBUG_OUTPUT if DEBUG_ALL_SHAPES else None)
+        build_all_wall_segments(wall_polygons, builder)
 
     # Combine all walls for cutting out room shapes
     all_polygons = list(chain.from_iterable(shape.polygons for shape in all_shapes))
