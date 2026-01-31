@@ -184,9 +184,8 @@ def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
         return
 
     if name == "walls":
-        name = "Wall"
-        builder.extrude_shape(final_indices, final_vertices, height=height)
-        builder.create_mesh("Wall_", None, None)
+        # Use segmented wall building - splits walls at angle changes (corners)
+        build_segmented_walls(merged, builder, height=height)
         return
 
     return []
@@ -463,6 +462,192 @@ def simplify_polygon(polygon: Polygon, kind: str):
     polygon = polygon.simplify(tolerance=simplification_tolerance)  # pyright: ignore[reportAssignmentType]
 
     return polygon
+
+
+# --- WALL SEGMENTATION BY ANGLE ---
+
+def get_edge_angle(p1: tuple, p2: tuple) -> float:
+    """Calculate angle of edge in radians."""
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    return np.arctan2(dy, dx)
+
+
+def angle_difference(a1: float, a2: float) -> float:
+    """
+    Calculate absolute angle change, normalized for 180° symmetry.
+    A wall facing left is the same segment as a wall facing right.
+    """
+    diff = abs(a1 - a2)
+    # Normalize for wraparound at ±π
+    diff = min(diff, 2 * np.pi - diff)
+    # 180° symmetry (opposite direction is same segment)
+    if diff > np.pi / 2:
+        diff = np.pi - diff
+    return diff
+
+
+def group_edges_by_angle(
+    coords: list,
+    angle_threshold_degrees: float = 15.0,
+    min_edge_length: float = 0.01
+) -> list[list[tuple[tuple, tuple]]]:
+    """
+    Group consecutive polygon edges by angle.
+
+    Args:
+        coords: List of points [(x,y), ...] - closed polygon
+        angle_threshold_degrees: Maximum angle change within one group
+        min_edge_length: Ignore edges shorter than this value
+
+    Returns:
+        List of groups, where each group is a list of edges [(p1,p2), (p2,p3), ...]
+    """
+    # Remove duplicate last point if present
+    coords = list(coords)
+    if len(coords) > 1 and coords[0] == coords[-1]:
+        coords = coords[:-1]
+
+    if len(coords) < 3:
+        return []
+
+    threshold = np.radians(angle_threshold_degrees)
+
+    # Create edges with angles
+    edges = []
+    for i in range(len(coords)):
+        p1 = coords[i]
+        p2 = coords[(i + 1) % len(coords)]
+        length = np.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+
+        if length < min_edge_length:
+            continue  # Ignore very short edges
+
+        angle = get_edge_angle(p1, p2)
+        edges.append({'start': p1, 'end': p2, 'angle': angle})
+
+    if not edges:
+        return []
+
+    # Group edges
+    groups = []
+    current_group = [edges[0]]
+
+    for i in range(1, len(edges)):
+        current = edges[i]
+        prev = current_group[-1]  # Compare with last edge in group
+
+        diff = angle_difference(current['angle'], prev['angle'])
+
+        if diff < threshold:
+            current_group.append(current)
+        else:
+            groups.append(current_group)
+            current_group = [current]
+
+    groups.append(current_group)
+
+    # Check if first and last group can be merged
+    if len(groups) > 1:
+        first_angle = groups[0][0]['angle']
+        last_angle = groups[-1][-1]['angle']
+
+        if angle_difference(first_angle, last_angle) < threshold:
+            # Merge: last group + first group
+            groups[0] = groups[-1] + groups[0]
+            groups.pop()
+
+    # Convert to output format
+    return [
+        [(e['start'], e['end']) for e in group]
+        for group in groups
+    ]
+
+
+def build_segmented_walls(
+    merged: list[Polygon],
+    builder: MeshBuilder,
+    height: float = 2.6,
+    angle_threshold: float = 15.0
+):
+    """
+    Build 3D walls segmented by angle.
+
+    Each segment with constant angle becomes a separate mesh.
+    This allows L-shaped walls to be split into separate objects at corners.
+    """
+    # --- STEP 1: Create floor and ceiling (shared for all polygons) ---
+    final_vertices = []
+    final_indices = []
+    v_offset = 0
+
+    for poly in merged:
+        v_list = [np.array(poly.exterior.coords)[:-1]]
+        rings = [len(v_list[0])]
+
+        for hole in poly.interiors:
+            v_list.append(np.array(hole.coords)[:-1])
+            rings.append(len(v_list[-1]))
+
+        vertices = np.vstack(v_list).astype(np.float32)
+
+        if len(rings) > 1:
+            ring_indices = np.cumsum(rings)[:-1].astype(np.uint32)
+        else:
+            ring_indices = np.array([], dtype=np.uint32)
+
+        indices = triangulate_float32(
+            vertices,
+            np.concat([ring_indices, [np.uint32(len(vertices))]], dtype=np.uint32)
+        )
+
+        final_vertices.extend(vertices)
+        final_indices.extend(indices + v_offset)
+        v_offset += len(vertices)
+
+    final_vertices = np.array(final_vertices)
+    final_indices = np.array(final_indices)
+
+    # Floor (bottom of wall)
+    builder.add_mesh_segment(final_indices, np.insert(final_vertices, 1, 0, axis=1))
+    builder.create_mesh("WallFloor_", None, None)
+
+    # Ceiling (top of wall)
+    builder.add_mesh_segment(final_indices[::-1], np.insert(final_vertices, 1, height, axis=1))
+    builder.create_mesh("WallCeiling_", None, None)
+
+    # --- STEP 2: Create segmented vertical walls for each polygon ---
+    for poly in merged:
+        # Exterior boundary
+        exterior_coords = list(poly.exterior.coords)
+        groups = group_edges_by_angle(exterior_coords, angle_threshold)
+
+        for group in groups:
+            for (p1, p2) in group:
+                # Quad for exterior wall (normals facing outward)
+                builder.add_quad(
+                    [p2[0], 0, p2[1]],
+                    [p1[0], 0, p1[1]],
+                    [p1[0], height, p1[1]],
+                    [p2[0], height, p2[1]],
+                )
+            builder.create_mesh("Wall_", None, None)
+
+        # Interior boundaries (holes) - normals facing inward
+        for hole in poly.interiors:
+            hole_coords = list(hole.coords)
+            hole_groups = group_edges_by_angle(hole_coords, angle_threshold)
+
+            for group in hole_groups:
+                for (p1, p2) in group:
+                    # Quad for interior wall (inverted normals)
+                    builder.add_quad(
+                        [p1[0], 0, p1[1]],
+                        [p2[0], 0, p2[1]],
+                        [p2[0], height, p2[1]],
+                        [p1[0], height, p1[1]],
+                    )
+                builder.create_mesh("Wall_", None, None)
 
 
 def convert_to_gltf(name: str):
