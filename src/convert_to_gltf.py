@@ -16,189 +16,6 @@ from .config import DEBUG_ALL_SHAPES, DEBUG_DOOR_FIX, DEBUG_EXTENDING_OBJECTS, D
 from .MeshBuilder import MeshBuilder
 
 
-# =============================================================================
-# WALL SEGMENTATION - Split walls at corners/angle changes
-# =============================================================================
-
-def _split_line_at_corners(line: LineString, angle_threshold: float = 45.0) -> list[LineString]:
-    """
-    Split a LineString at points where the direction changes significantly.
-    Used to split wall skeleton into straight segments.
-    """
-    coords = np.array(line.coords)
-    n = len(coords)
-
-    if n < 3:
-        return [line]
-
-    # Find corner indices where angle deviates from straight line
-    corner_indices = [0]
-
-    for i in range(1, n - 1):
-        p_prev = coords[i - 1]
-        p_curr = coords[i]
-        p_next = coords[i + 1]
-
-        v1 = p_prev - p_curr
-        v2 = p_next - p_curr
-
-        # Normalize vectors
-        v1_len = np.linalg.norm(v1)
-        v2_len = np.linalg.norm(v2)
-        if v1_len < 1e-10 or v2_len < 1e-10:
-            continue
-
-        v1 = v1 / v1_len
-        v2 = v2 / v2_len
-
-        # Angle between vectors (should be ~180 for straight line)
-        dot = np.clip(np.dot(v1, v2), -1, 1)
-        angle = np.degrees(np.arccos(dot))
-
-        # If angle is significantly different from 180° (straight), it's a corner
-        if angle < 180 - angle_threshold:
-            corner_indices.append(i)
-
-    corner_indices.append(n - 1)
-
-    # Create segments between corners
-    segments = []
-    for i in range(len(corner_indices) - 1):
-        start = corner_indices[i]
-        end = corner_indices[i + 1] + 1  # Include end point
-        if end - start >= 2:
-            seg_coords = coords[start:end]
-            segments.append(LineString(seg_coords))
-
-    return segments if segments else [line]
-
-
-def _reconstruct_wall_from_centerline(centerline: LineString, original_polygon: Polygon, width: float) -> Polygon | None:
-    """
-    Reconstruct a wall segment from its centerline by buffering.
-    Clips to original polygon to maintain accuracy.
-    """
-    # Buffer the centerline with flat caps to create rectangular wall
-    buffered = centerline.buffer(width * 0.55, cap_style='flat')
-
-    # Intersect with original polygon to clean up edges
-    result = buffered.intersection(original_polygon)
-
-    if isinstance(result, Polygon) and result.area > 0:
-        return result
-    elif isinstance(result, (MultiPolygon, GeometryCollection)):
-        # Return the largest piece
-        polygons = [g for g in result.geoms if isinstance(g, Polygon) and g.area > 0]
-        if polygons:
-            return max(polygons, key=lambda p: p.area)
-
-    return None
-
-
-def segment_wall_polygon(polygon: Polygon, min_segment_area_ratio: float = 0.01) -> list[Polygon]:
-    """
-    Segment a wall polygon into separate straight wall sections.
-
-    Uses skeleton-based approach:
-    1. Estimate wall width from polygon geometry
-    2. Progressively erode polygon to extract centerline/skeleton
-    3. Split skeleton at corners (where angle changes significantly)
-    4. Reconstruct wall segments by buffering skeleton parts
-
-    Args:
-        polygon: The wall polygon to segment
-        min_segment_area_ratio: Minimum segment area as ratio of original (filter tiny fragments)
-
-    Returns:
-        List of polygon segments. If segmentation fails, returns [polygon].
-    """
-    # Skip very simple polygons (rectangles with 4 corners)
-    exterior_coords = np.array(polygon.exterior.coords)[:-1]
-    if len(exterior_coords) <= 8:
-        return [polygon]
-
-    # Estimate wall width using perimeter/area relationship
-    # For a thin rectangle: width ≈ 2 * area / perimeter
-    perimeter = polygon.exterior.length
-    area = polygon.area
-    estimated_width = 2 * area / perimeter
-
-    # Skip if wall is too thick (likely not a wall, or very short)
-    if estimated_width > perimeter / 4:
-        return [polygon]
-
-    # Progressive erosion to find skeleton
-    eroded = polygon
-    erosion_amount = estimated_width * 0.4
-
-    max_iterations = 10
-    skeleton_parts = []
-
-    for iteration in range(max_iterations):
-        new_eroded = eroded.buffer(-erosion_amount)
-
-        if new_eroded.is_empty:
-            # We've eroded away completely - use last valid shape
-            break
-
-        # Check if we created multiple disconnected parts
-        if isinstance(new_eroded, (MultiPolygon, GeometryCollection)):
-            # Multiple parts indicate we're near the skeleton junctions
-            for geom in new_eroded.geoms:
-                if isinstance(geom, Polygon) and geom.area > 0:
-                    skeleton_parts.append(geom)
-            break
-
-        # Check if shape is very thin (approaching skeleton)
-        new_width = 2 * new_eroded.area / new_eroded.length if new_eroded.length > 0 else 0
-        if new_width < estimated_width * 0.3:
-            skeleton_parts.append(new_eroded)
-            break
-
-        eroded = new_eroded
-        erosion_amount *= 0.7  # Progressively smaller erosion
-
-    # If no skeleton parts found, use the last eroded shape
-    if not skeleton_parts and isinstance(eroded, Polygon):
-        skeleton_parts = [eroded]
-
-    if not skeleton_parts:
-        return [polygon]
-
-    # Convert skeleton polygons to centerlines and split at corners
-    all_centerline_segments = []
-
-    for skeleton in skeleton_parts:
-        # Use the exterior ring as the centerline approximation
-        centerline = LineString(skeleton.exterior.coords)
-
-        # Split at corners
-        segments = _split_line_at_corners(centerline, angle_threshold=45.0)
-        all_centerline_segments.extend(segments)
-
-    if not all_centerline_segments:
-        return [polygon]
-
-    # Reconstruct wall polygons from centerline segments
-    result_walls = []
-    min_area = polygon.area * min_segment_area_ratio
-
-    for centerline in all_centerline_segments:
-        # Skip very short segments
-        if centerline.length < estimated_width * 0.5:
-            continue
-
-        wall = _reconstruct_wall_from_centerline(centerline, polygon, estimated_width)
-        if wall and wall.area > min_area:
-            result_walls.append(wall)
-
-    # If no valid segments produced, return original
-    if not result_walls:
-        return [polygon]
-
-    return result_walls
-
-
 def path_to_points(path, distance_step=1.0):
     points = []
     for segment in path:
@@ -367,49 +184,12 @@ def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
         return
 
     if name == "walls":
-        # For walls, we build ONE mesh from all wall polygons together
-        # Segmentation is handled separately if needed
+        name = "Wall"
         builder.extrude_shape(final_indices, final_vertices, height=height)
         builder.create_mesh("Wall_", None, None)
         return
 
     return []
-
-
-def build_wall_segments(polygons: list[Polygon], builder: MeshBuilder):
-    """
-    Build wall geometry with automatic segmentation at corners.
-
-    Each wall polygon is segmented into straight sections,
-    and each segment becomes a separate mesh for easier manipulation.
-    """
-    height = 2.6
-
-    for polygon in polygons:
-        # Segment the wall polygon at corners
-        segments = segment_wall_polygon(polygon)
-
-        for segment in segments:
-            # Build mesh for this segment
-            v_list = [np.array(segment.exterior.coords)[:-1]]
-            rings = [len(v_list[0])]
-
-            for hole in segment.interiors:
-                v_list.append(np.array(hole.coords)[:-1])
-                rings.append(len(v_list[-1]))
-
-            vertices = np.vstack(v_list).astype(np.float32)
-
-            if len(rings) > 1:
-                ring_indices = np.cumsum(rings)[:-1].astype(np.uint32)
-            else:
-                ring_indices = np.array([], dtype=np.uint32)
-
-            indices = triangulate_float32(vertices, np.concat([ring_indices, [np.uint32(len(vertices))]], dtype=np.uint32))
-
-            # Extrude and create mesh
-            builder.extrude_shape(list(indices), vertices, height=height)
-            builder.create_mesh("Wall_", None, None)
 
 
 @dataclass
@@ -738,13 +518,9 @@ def convert_to_gltf(name: str):
 
     extend_doors_and_windows_to_touch_walls(all_shapes)
 
-    # Build geometry for all shapes
+    # Build wall geometry
     for shape in all_shapes:
-        if shape.kind == "walls":
-            # Use segmented wall building - splits walls at angle changes
-            build_wall_segments(shape.polygons, builder)
-        else:
-            build_shape(shape.kind, shape.polygons, builder)
+        build_shape(shape.kind, shape.polygons, builder)
 
     # Combine all walls for cutting out room shapes
     all_polygons = list(chain.from_iterable(shape.polygons for shape in all_shapes))

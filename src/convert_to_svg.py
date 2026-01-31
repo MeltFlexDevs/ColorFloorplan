@@ -55,7 +55,7 @@ def convert_to_svg(name: str, input: Path | IO[bytes] | BytesIO):
         output_image.save(intermediate)
 
         # Convert to SVG
-        process = subprocess.Popen(["potrace", "-b", "svg", intermediate, "-o", intermediate.with_suffix(".svg")])
+        process = subprocess.Popen(["vendor/potrace/potrace", "-b", "svg", intermediate, "-o", intermediate.with_suffix(".svg")])
         processes.append(process)
         intermediates.append(intermediate)
 
