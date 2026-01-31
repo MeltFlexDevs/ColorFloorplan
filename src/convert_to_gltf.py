@@ -564,6 +564,25 @@ def group_edges_by_angle(
     ]
 
 
+def estimate_wall_thickness(polygon: Polygon) -> float:
+    """
+    Estimate wall thickness from polygon geometry.
+    Uses the minimum distance from centroid to boundary as approximation.
+    """
+    # Use buffer-based estimation: shrink polygon until it disappears
+    # The amount we can shrink is roughly half the wall thickness
+    area = polygon.area
+    perimeter = polygon.exterior.length
+
+    # Approximate thickness using area/perimeter ratio
+    # For a rectangle: area = L*W, perimeter = 2(L+W)
+    # If L >> W (long thin wall): thickness ≈ 2*area/perimeter
+    estimated = 2 * area / perimeter if perimeter > 0 else 0.2
+
+    # Clamp to reasonable values (10cm to 1m)
+    return max(0.1, min(1.0, estimated))
+
+
 def build_segmented_walls(
     merged: list[Polygon],
     builder: MeshBuilder,
@@ -573,80 +592,76 @@ def build_segmented_walls(
     """
     Build 3D walls segmented by angle.
 
-    Each segment with constant angle becomes a separate mesh.
+    Each segment with constant angle becomes a separate, complete 3D mesh
+    with floor, ceiling, and all wall faces (front, back, sides).
     This allows L-shaped walls to be split into separate objects at corners.
     """
-    # --- STEP 1: Create floor and ceiling (shared for all polygons) ---
-    final_vertices = []
-    final_indices = []
-    v_offset = 0
-
     for poly in merged:
-        v_list = [np.array(poly.exterior.coords)[:-1]]
-        rings = [len(v_list[0])]
+        # Estimate wall thickness for this polygon
+        wall_thickness = estimate_wall_thickness(poly)
+        half_thickness = wall_thickness / 2
 
-        for hole in poly.interiors:
-            v_list.append(np.array(hole.coords)[:-1])
-            rings.append(len(v_list[-1]))
-
-        vertices = np.vstack(v_list).astype(np.float32)
-
-        if len(rings) > 1:
-            ring_indices = np.cumsum(rings)[:-1].astype(np.uint32)
-        else:
-            ring_indices = np.array([], dtype=np.uint32)
-
-        indices = triangulate_float32(
-            vertices,
-            np.concat([ring_indices, [np.uint32(len(vertices))]], dtype=np.uint32)
-        )
-
-        final_vertices.extend(vertices)
-        final_indices.extend(indices + v_offset)
-        v_offset += len(vertices)
-
-    final_vertices = np.array(final_vertices)
-    final_indices = np.array(final_indices)
-
-    # Floor (bottom of wall)
-    builder.add_mesh_segment(final_indices, np.insert(final_vertices, 1, 0, axis=1))
-    builder.create_mesh("WallFloor_", None, None)
-
-    # Ceiling (top of wall)
-    builder.add_mesh_segment(final_indices[::-1], np.insert(final_vertices, 1, height, axis=1))
-    builder.create_mesh("WallCeiling_", None, None)
-
-    # --- STEP 2: Create segmented vertical walls for each polygon ---
-    for poly in merged:
-        # Exterior boundary
+        # Exterior boundary - group edges by angle
         exterior_coords = list(poly.exterior.coords)
         groups = group_edges_by_angle(exterior_coords, angle_threshold)
 
         for group in groups:
+            # Create a LineString from this group of edges
+            points = [group[0][0]]  # First point of first edge
             for (p1, p2) in group:
-                # Quad for exterior wall (normals facing outward)
-                builder.add_quad(
-                    [p2[0], 0, p2[1]],
-                    [p1[0], 0, p1[1]],
-                    [p1[0], height, p1[1]],
-                    [p2[0], height, p2[1]],
-                )
+                points.append(p2)  # Add end point of each edge
+
+            line = LineString(points)
+
+            # Buffer the line to create a strip polygon (wall segment footprint)
+            # Use flat cap style to avoid rounded ends
+            strip = line.buffer(half_thickness, cap_style='flat', join_style='mitre')
+
+            if strip.is_empty or not isinstance(strip, Polygon):
+                continue
+
+            # Triangulate the strip polygon
+            strip_coords = np.array(strip.exterior.coords)[:-1].astype(np.float32)
+
+            if len(strip_coords) < 3:
+                continue
+
+            strip_indices = triangulate_float32(
+                strip_coords,
+                np.array([len(strip_coords)], dtype=np.uint32)
+            )
+
+            # Use extrude_shape to create complete 3D geometry
+            builder.extrude_shape(strip_indices, strip_coords, height=height)
             builder.create_mesh("Wall_", None, None)
 
-        # Interior boundaries (holes) - normals facing inward
+        # Interior boundaries (holes) - same process
         for hole in poly.interiors:
             hole_coords = list(hole.coords)
             hole_groups = group_edges_by_angle(hole_coords, angle_threshold)
 
             for group in hole_groups:
+                points = [group[0][0]]
                 for (p1, p2) in group:
-                    # Quad for interior wall (inverted normals)
-                    builder.add_quad(
-                        [p1[0], 0, p1[1]],
-                        [p2[0], 0, p2[1]],
-                        [p2[0], height, p2[1]],
-                        [p1[0], height, p1[1]],
-                    )
+                    points.append(p2)
+
+                line = LineString(points)
+                strip = line.buffer(half_thickness, cap_style='flat', join_style='mitre')
+
+                if strip.is_empty or not isinstance(strip, Polygon):
+                    continue
+
+                strip_coords = np.array(strip.exterior.coords)[:-1].astype(np.float32)
+
+                if len(strip_coords) < 3:
+                    continue
+
+                strip_indices = triangulate_float32(
+                    strip_coords,
+                    np.array([len(strip_coords)], dtype=np.uint32)
+                )
+
+                builder.extrude_shape(strip_indices, strip_coords, height=height)
                 builder.create_mesh("Wall_", None, None)
 
 
