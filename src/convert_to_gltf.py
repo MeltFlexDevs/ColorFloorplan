@@ -14,6 +14,7 @@ from svgpathtools import svg2paths
 
 from .config import DEBUG_ALL_SHAPES, DEBUG_DOOR_FIX, DEBUG_EXTENDING_OBJECTS, DEBUG_OUTPUT, DELETE_SVG, OUTPUT_FOLDER
 from .MeshBuilder import MeshBuilder
+from .wall_segmentation import segment_all_walls, WallSegment
 
 
 def path_to_points(path, distance_step=1.0):
@@ -184,11 +185,62 @@ def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
         return
 
     if name == "walls":
-        # Use segmented wall building - splits walls at angle changes (corners)
-        build_segmented_walls(merged, builder, height=height)
+        # Steny sa spracúvajú cez build_wall_segments, nie tu
+        builder.extrude_shape(final_indices, final_vertices, height=height)
+        builder.create_mesh("Wall_", None, None)
         return
 
     return []
+
+
+def build_single_wall_segment(segment: WallSegment, builder: MeshBuilder, height: float = 2.6):
+    """
+    Vytvorí 3D mesh pre jeden segment steny.
+    """
+    poly = segment.polygon
+
+    # Priprav vrcholy a indexy
+    v_list = [np.array(poly.exterior.coords)[:-1]]
+    rings = [len(v_list[0])]
+
+    for hole in poly.interiors:
+        v_list.append(np.array(hole.coords)[:-1])
+        rings.append(len(v_list[-1]))
+
+    vertices = np.vstack(v_list).astype(np.float32)
+
+    if len(rings) > 1:
+        ring_indices = np.cumsum(rings)[:-1].astype(np.uint32)
+    else:
+        ring_indices = np.array([], dtype=np.uint32)
+
+    indices = triangulate_float32(vertices, np.concat([ring_indices, [np.uint32(len(vertices))]], dtype=np.uint32))
+
+    # Vytvor mesh s názvom podľa typu segmentu
+    segment_type_prefix = {
+        "straight": "Wall",
+        "angled": "AngledWall",
+        "curved": "CurvedWall"
+    }.get(segment.segment_type, "Wall")
+
+    builder.extrude_shape(list(indices), vertices, height=height)
+    builder.create_mesh(f"{segment_type_prefix}_", None, None)
+
+
+def build_wall_segments(wall_polygons: list[Polygon], builder: MeshBuilder, debug_output=None):
+    """
+    Rozdelí steny na segmenty podľa uhlov a vytvorí samostatné meshe.
+    """
+    # Segmentuj všetky steny
+    segments = segment_all_walls(wall_polygons, debug_output)
+
+    height = 2.6
+
+    # Vytvor mesh pre každý segment
+    for segment in segments:
+        build_single_wall_segment(segment, builder, height)
+
+    return segments
 
 
 @dataclass
@@ -464,246 +516,6 @@ def simplify_polygon(polygon: Polygon, kind: str):
     return polygon
 
 
-# --- WALL SEGMENTATION BY ANGLE ---
-
-def get_edge_angle(p1: tuple, p2: tuple) -> float:
-    """Calculate angle of edge in radians."""
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
-    return np.arctan2(dy, dx)
-
-
-def angle_difference(a1: float, a2: float) -> float:
-    """
-    Calculate absolute angle change, normalized for 180° symmetry.
-    A wall facing left is the same segment as a wall facing right.
-    """
-    diff = abs(a1 - a2)
-    # Normalize for wraparound at ±π
-    diff = min(diff, 2 * np.pi - diff)
-    # 180° symmetry (opposite direction is same segment)
-    if diff > np.pi / 2:
-        diff = np.pi - diff
-    return diff
-
-
-def group_edges_by_angle(
-    coords: list,
-    angle_threshold_degrees: float = 15.0,
-    min_edge_length: float = 0.01
-) -> list[list[tuple[tuple, tuple]]]:
-    """
-    Group consecutive polygon edges by angle.
-
-    Args:
-        coords: List of points [(x,y), ...] - closed polygon
-        angle_threshold_degrees: Maximum angle change within one group
-        min_edge_length: Ignore edges shorter than this value
-
-    Returns:
-        List of groups, where each group is a list of edges [(p1,p2), (p2,p3), ...]
-    """
-    # Remove duplicate last point if present
-    coords = list(coords)
-    if len(coords) > 1 and coords[0] == coords[-1]:
-        coords = coords[:-1]
-
-    if len(coords) < 3:
-        return []
-
-    threshold = np.radians(angle_threshold_degrees)
-
-    # Create edges with angles
-    edges = []
-    for i in range(len(coords)):
-        p1 = coords[i]
-        p2 = coords[(i + 1) % len(coords)]
-        length = np.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
-
-        if length < min_edge_length:
-            continue  # Ignore very short edges
-
-        angle = get_edge_angle(p1, p2)
-        edges.append({'start': p1, 'end': p2, 'angle': angle})
-
-    if not edges:
-        return []
-
-    # Group edges
-    groups = []
-    current_group = [edges[0]]
-
-    for i in range(1, len(edges)):
-        current = edges[i]
-        prev = current_group[-1]  # Compare with last edge in group
-
-        diff = angle_difference(current['angle'], prev['angle'])
-
-        if diff < threshold:
-            current_group.append(current)
-        else:
-            groups.append(current_group)
-            current_group = [current]
-
-    groups.append(current_group)
-
-    # Check if first and last group can be merged
-    if len(groups) > 1:
-        first_angle = groups[0][0]['angle']
-        last_angle = groups[-1][-1]['angle']
-
-        if angle_difference(first_angle, last_angle) < threshold:
-            # Merge: last group + first group
-            groups[0] = groups[-1] + groups[0]
-            groups.pop()
-
-    # Convert to output format
-    return [
-        [(e['start'], e['end']) for e in group]
-        for group in groups
-    ]
-
-
-def get_wall_thickness(polygon: Polygon) -> float:
-    """
-    Estimate wall thickness from polygon geometry.
-    Uses area/perimeter ratio as approximation.
-    """
-    area = polygon.area
-    perimeter = polygon.exterior.length
-    if perimeter == 0:
-        return 0.2
-    # For a long thin rectangle: thickness ≈ 2*area/perimeter
-    estimated = 2 * area / perimeter
-    return max(0.05, min(0.5, estimated))
-
-
-def get_inward_normal(p1: tuple, p2: tuple) -> np.ndarray:
-    """
-    Get the inward-facing normal vector for an edge.
-    For exterior boundary (CCW), inward is to the right of edge direction.
-    """
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
-    length = np.sqrt(dx*dx + dy*dy)
-    if length == 0:
-        return np.array([0.0, 0.0])
-    # Perpendicular vector (rotated 90° clockwise = inward for CCW polygon)
-    return np.array([dy / length, -dx / length])
-
-
-def build_segmented_walls(
-    merged: list[Polygon],
-    builder: MeshBuilder,
-    height: float = 2.6,
-    angle_threshold: float = 15.0
-):
-    """
-    Build 3D walls segmented by angle.
-
-    Each Wall_ segment is a complete closed 3D box with:
-    - Outer vertical face
-    - Inner vertical face
-    - Top face (connecting outer and inner)
-    - Bottom face (connecting outer and inner)
-    """
-    for poly in merged:
-        # Estimate wall thickness for this polygon
-        thickness = get_wall_thickness(poly)
-
-        # --- Process exterior boundary ---
-        exterior_coords = list(poly.exterior.coords)
-        groups = group_edges_by_angle(exterior_coords, angle_threshold)
-
-        for group in groups:
-            for (p1, p2) in group:
-                # Calculate inward offset points
-                normal = get_inward_normal(p1, p2)
-                p1_inner = (p1[0] + normal[0] * thickness, p1[1] + normal[1] * thickness)
-                p2_inner = (p2[0] + normal[0] * thickness, p2[1] + normal[1] * thickness)
-
-                # Outer vertical wall (normals facing outward)
-                builder.add_quad(
-                    [p2[0], 0, p2[1]],
-                    [p1[0], 0, p1[1]],
-                    [p1[0], height, p1[1]],
-                    [p2[0], height, p2[1]],
-                )
-
-                # Inner vertical wall (normals facing inward)
-                builder.add_quad(
-                    [p1_inner[0], 0, p1_inner[1]],
-                    [p2_inner[0], 0, p2_inner[1]],
-                    [p2_inner[0], height, p2_inner[1]],
-                    [p1_inner[0], height, p1_inner[1]],
-                )
-
-                # Bottom face (connecting outer and inner)
-                builder.add_quad(
-                    [p1[0], 0, p1[1]],
-                    [p2[0], 0, p2[1]],
-                    [p2_inner[0], 0, p2_inner[1]],
-                    [p1_inner[0], 0, p1_inner[1]],
-                )
-
-                # Top face (connecting outer and inner)
-                builder.add_quad(
-                    [p2[0], height, p2[1]],
-                    [p1[0], height, p1[1]],
-                    [p1_inner[0], height, p1_inner[1]],
-                    [p2_inner[0], height, p2_inner[1]],
-                )
-
-            builder.create_mesh("Wall_", None, None)
-
-        # --- Process interior boundaries (holes) ---
-        for hole in poly.interiors:
-            hole_coords = list(hole.coords)
-            hole_groups = group_edges_by_angle(hole_coords, angle_threshold)
-
-            for group in hole_groups:
-                for (p1, p2) in group:
-                    # For holes, inward normal points outward from hole (opposite direction)
-                    normal = get_inward_normal(p1, p2)
-                    # Negate for holes (CW orientation)
-                    p1_outer = (p1[0] - normal[0] * thickness, p1[1] - normal[1] * thickness)
-                    p2_outer = (p2[0] - normal[0] * thickness, p2[1] - normal[1] * thickness)
-
-                    # Inner vertical wall (facing into room)
-                    builder.add_quad(
-                        [p1[0], 0, p1[1]],
-                        [p2[0], 0, p2[1]],
-                        [p2[0], height, p2[1]],
-                        [p1[0], height, p1[1]],
-                    )
-
-                    # Outer vertical wall
-                    builder.add_quad(
-                        [p2_outer[0], 0, p2_outer[1]],
-                        [p1_outer[0], 0, p1_outer[1]],
-                        [p1_outer[0], height, p1_outer[1]],
-                        [p2_outer[0], height, p2_outer[1]],
-                    )
-
-                    # Bottom face
-                    builder.add_quad(
-                        [p2[0], 0, p2[1]],
-                        [p1[0], 0, p1[1]],
-                        [p1_outer[0], 0, p1_outer[1]],
-                        [p2_outer[0], 0, p2_outer[1]],
-                    )
-
-                    # Top face
-                    builder.add_quad(
-                        [p1[0], height, p1[1]],
-                        [p2[0], height, p2[1]],
-                        [p2_outer[0], height, p2_outer[1]],
-                        [p1_outer[0], height, p1_outer[1]],
-                    )
-
-                builder.create_mesh("Wall_", None, None)
-
-
 def convert_to_gltf(name: str):
     print(f"convert_to_gltf({name})")
     builder = MeshBuilder()
@@ -757,9 +569,17 @@ def convert_to_gltf(name: str):
 
     extend_doors_and_windows_to_touch_walls(all_shapes)
 
-    # Build wall geometry
+    # Build geometry - steny sa spracúvajú samostatne so segmentáciou
+    wall_polygons = []
     for shape in all_shapes:
-        build_shape(shape.kind, shape.polygons, builder)
+        if shape.kind == "walls":
+            wall_polygons.extend(shape.polygons)
+        else:
+            build_shape(shape.kind, shape.polygons, builder)
+
+    # Segmentuj a postav steny - každý segment je samostatný mesh
+    if wall_polygons:
+        build_wall_segments(wall_polygons, builder, DEBUG_OUTPUT if DEBUG_ALL_SHAPES else None)
 
     # Combine all walls for cutting out room shapes
     all_polygons = list(chain.from_iterable(shape.polygons for shape in all_shapes))
