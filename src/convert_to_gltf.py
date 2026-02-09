@@ -5,11 +5,14 @@ from sys import argv
 
 import numpy as np
 from mapbox_earcut import triangulate_float32
-from shapely import GeometryCollection, LineString, MultiPoint, Point, box, buffer, difference, oriented_envelope, union_all, make_valid
+from math import atan2, radians
+
+from shapely import GeometryCollection, LineString, MultiLineString, MultiPoint, Point, STRtree, box, buffer, difference, oriented_envelope, union_all, make_valid
 from shapely.affinity import affine_transform, scale
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import nearest_points
+from shapely.geometry.polygon import orient
+from shapely.ops import nearest_points, split
 from svgpathtools import svg2paths
 
 from .config import DEBUG_ALL_SHAPES, DEBUG_DOOR_FIX, DEBUG_EXTENDING_OBJECTS, DEBUG_OUTPUT, DELETE_SVG, OUTPUT_FOLDER
@@ -119,6 +122,519 @@ def svg_to_triangles_with_holes(file_path, name: str, builder: MeshBuilder):
 debug_shape_counter = 0
 
 
+@dataclass
+class ConcaveCorner:
+    index: int
+    vertex: np.ndarray
+    e_in: np.ndarray
+    e_out: np.ndarray
+    turn_angle: float
+
+
+def find_concave_corners(coords: list[tuple[float, ...]], angle_threshold_deg: float = 30.0) -> list[ConcaveCorner]:
+    """Walk exterior ring vertices (CCW) and identify concave corners above angle threshold."""
+    n = len(coords)
+    if n < 4:
+        return []
+
+    threshold_rad = radians(angle_threshold_deg)
+    corners: list[ConcaveCorner] = []
+
+    for i in range(n):
+        prev_pt = np.array(coords[(i - 1) % n])
+        curr_pt = np.array(coords[i])
+        next_pt = np.array(coords[(i + 1) % n])
+
+        e_in_raw = curr_pt - prev_pt
+        e_out_raw = next_pt - curr_pt
+
+        len_in = np.linalg.norm(e_in_raw)
+        len_out = np.linalg.norm(e_out_raw)
+        if len_in < 1e-10 or len_out < 1e-10:
+            continue
+
+        e_in = e_in_raw / len_in
+        e_out = e_out_raw / len_out
+
+        cross = e_in[0] * e_out[1] - e_in[1] * e_out[0]
+
+        # For CCW polygon, cross < 0 means concave (right turn)
+        if cross >= 0:
+            continue
+
+        dot_val = float(np.clip(np.dot(e_in, e_out), -1.0, 1.0))
+        turn_angle = abs(atan2(abs(cross), dot_val))
+
+        if turn_angle < threshold_rad:
+            continue
+
+        corners.append(ConcaveCorner(i, curr_pt, e_in, e_out, turn_angle))
+
+    return corners
+
+
+def compute_cut_line(polygon: Polygon, corner: ConcaveCorner, epsilon: float = 1e-4) -> LineString | None:
+    """Compute a cutting line from concave vertex across the wall width.
+
+    Tries extending in both the incoming edge direction and reversed outgoing
+    edge direction, picking the shorter cut (which crosses the wall thickness).
+    """
+    vertex = corner.vertex
+    boundary = polygon.exterior
+    max_len = boundary.length
+
+    candidates: list[tuple[float, LineString]] = []
+
+    for direction in [corner.e_in, -corner.e_out]:
+        far_point = vertex + direction * max_len
+        ray = LineString([vertex - direction * epsilon, far_point])
+
+        intersection = ray.intersection(boundary)
+        if intersection.is_empty:
+            continue
+
+        # Extract all intersection points
+        hit_points: list[Point] = []
+        if isinstance(intersection, MultiPoint):
+            hit_points = list(intersection.geoms)
+        elif isinstance(intersection, Point):
+            hit_points = [intersection]
+        elif isinstance(intersection, GeometryCollection):
+            for geom in intersection.geoms:
+                if isinstance(geom, Point):
+                    hit_points.append(geom)
+                elif isinstance(geom, LineString):
+                    for c in geom.coords:
+                        hit_points.append(Point(c))
+        elif isinstance(intersection, (LineString, MultiLineString)):
+            for c in intersection.coords if isinstance(intersection, LineString) else [c for ls in intersection.geoms for c in ls.coords]:
+                hit_points.append(Point(c))
+
+        # Filter out points too close to origin
+        vertex_point = Point(vertex)
+        hits = [p for p in hit_points if vertex_point.distance(p) > epsilon * 10]
+
+        if not hits:
+            continue
+
+        nearest = min(hits, key=lambda p: vertex_point.distance(p))
+        dist = vertex_point.distance(nearest)
+
+        # Create cut line, slightly extended for robust splitting
+        dir_norm = direction / np.linalg.norm(direction)
+        start = vertex - dir_norm * epsilon
+        end = np.array(nearest.coords[0]) + dir_norm * epsilon
+        candidates.append((dist, LineString([start, end])))
+
+    if not candidates:
+        return None
+
+    # Pick shorter cut (crosses wall width, not length)
+    candidates.sort(key=lambda c: c[0])
+    return candidates[0][1]
+
+
+def split_wall_polygon(
+    polygon: Polygon,
+    angle_threshold_deg: float = 30.0,
+    min_area: float = 0.001,
+    _depth: int = 0,
+) -> list[Polygon]:
+    """Split a wall polygon at concave corners into individual straight segments.
+
+    Recursively finds concave corners, cuts across the wall width at each,
+    and returns the list of resulting polygons. Curved walls are preserved
+    because their per-vertex angle changes are below the threshold.
+    """
+    if _depth > 20:
+        return [polygon]
+
+    polygon = orient(polygon, sign=1.0)
+    coords = list(polygon.exterior.coords)[:-1]
+
+    if len(coords) < 5:
+        return [polygon]
+
+    corners = find_concave_corners(coords, angle_threshold_deg)
+    if not corners:
+        return [polygon]
+
+    # Try each corner, starting with the sharpest turn
+    corners.sort(key=lambda c: -c.turn_angle)
+
+    for corner in corners:
+        cut_line = compute_cut_line(polygon, corner)
+        if cut_line is None:
+            continue
+
+        try:
+            result = split(polygon, cut_line)
+        except Exception:
+            continue
+
+        pieces = [g for g in result.geoms if isinstance(g, Polygon) and g.area > min_area]
+
+        if len(pieces) < 2:
+            continue
+
+        # Successfully split - recurse on each piece
+        final: list[Polygon] = []
+        for piece in pieces:
+            final.extend(split_wall_polygon(piece, angle_threshold_deg, min_area, _depth + 1))
+        return final
+
+    # No successful split found
+    return [polygon]
+
+
+def _wall_long_axis(wall_poly: Polygon):
+    """Get the long axis direction and endpoints for a wall polygon via its minimum rotated rectangle."""
+    obb = wall_poly.minimum_rotated_rectangle
+    obb_coords = list(obb.exterior.coords)[:-1]
+
+    edge1_len = np.linalg.norm(np.array(obb_coords[1]) - np.array(obb_coords[0]))
+    edge2_len = np.linalg.norm(np.array(obb_coords[2]) - np.array(obb_coords[1]))
+
+    if edge1_len >= edge2_len:
+        start = (np.array(obb_coords[0]) + np.array(obb_coords[3])) / 2
+        end = (np.array(obb_coords[1]) + np.array(obb_coords[2])) / 2
+    else:
+        start = (np.array(obb_coords[0]) + np.array(obb_coords[1])) / 2
+        end = (np.array(obb_coords[3]) + np.array(obb_coords[2])) / 2
+
+    return start, end
+
+
+def split_wall_by_rooms(
+    wall_poly: Polygon,
+    rooms: "list[Polygon]",
+    min_area: float = 0.001,
+) -> list[Polygon]:
+    """Split a wall polygon where it transitions from bordering one room to another.
+
+    Samples points along both sides of the wall just outside its boundary.
+    Where the adjacent room changes, a perpendicular cut is made.
+    """
+    start, end = _wall_long_axis(wall_poly)
+    long_vec = end - start
+    length = np.linalg.norm(long_vec)
+
+    if length < 0.05:
+        return [wall_poly]
+
+    long_dir = long_vec / length
+    perp = np.array([-long_dir[1], long_dir[0]])
+
+    # Estimate wall half-thickness from OBB short dimension
+    obb = wall_poly.minimum_rotated_rectangle
+    obb_coords = list(obb.exterior.coords)[:-1]
+    e1 = np.linalg.norm(np.array(obb_coords[1]) - np.array(obb_coords[0]))
+    e2 = np.linalg.norm(np.array(obb_coords[2]) - np.array(obb_coords[1]))
+    wall_half_thickness = min(e1, e2) / 2
+
+    # Probe distance: just beyond the wall surface
+    probe_dist = wall_half_thickness + 0.05
+
+    # Prepare rooms for fast lookup via STRtree
+    room_tree = STRtree(rooms)
+
+    def find_room_id(point: Point) -> int:
+        hits = room_tree.query(point)
+        for idx in hits:
+            if rooms[idx].contains(point):
+                return idx
+        return -1
+
+    # Sample along wall length
+    num_samples = max(int(length / 0.02), 20)
+
+    assignments: list[tuple[float, int, int]] = []
+    for i in range(num_samples + 1):
+        t = i / num_samples
+        center = start + long_vec * t
+        side_a_pt = Point(center + perp * probe_dist)
+        side_b_pt = Point(center - perp * probe_dist)
+        ra = find_room_id(side_a_pt)
+        rb = find_room_id(side_b_pt)
+        assignments.append((t, ra, rb))
+
+    # Find transition points (where room assignment changes on either side)
+    transition_ts: list[float] = []
+    for i in range(1, len(assignments)):
+        prev_t, prev_a, prev_b = assignments[i - 1]
+        curr_t, curr_a, curr_b = assignments[i]
+        if prev_a != curr_a or prev_b != curr_b:
+            mid_t = (prev_t + curr_t) / 2
+            transition_ts.append(mid_t)
+
+    if not transition_ts:
+        return [wall_poly]
+
+    # Deduplicate transitions that are very close together
+    deduped: list[float] = [transition_ts[0]]
+    for t in transition_ts[1:]:
+        if t - deduped[-1] > 0.01:
+            deduped.append(t)
+    transition_ts = deduped
+
+    # Create perpendicular cutting lines at each transition
+    result = [wall_poly]
+    for t in transition_ts:
+        center = start + long_vec * t
+        # Extend cut line well beyond the wall to ensure a clean split
+        cut_start = center - perp * (length + 1)
+        cut_end = center + perp * (length + 1)
+        cut_line = LineString([cut_start, cut_end])
+
+        new_result: list[Polygon] = []
+        for poly in result:
+            try:
+                parts = split(poly, cut_line)
+                new_result.extend(g for g in parts.geoms if isinstance(g, Polygon) and g.area > min_area)
+            except Exception:
+                new_result.append(poly)
+        result = new_result
+
+    return result if result else [wall_poly]
+
+
+def triangulate_single_polygon(poly: Polygon) -> tuple[np.ndarray, np.ndarray]:
+    """Triangulate a single polygon (with possible holes) into vertices and indices."""
+    v_list = [np.array(poly.exterior.coords)[:-1]]
+    rings = [len(v_list[0])]
+
+    for hole in poly.interiors:
+        v_list.append(np.array(hole.coords)[:-1])
+        rings.append(len(v_list[-1]))
+
+    vertices = np.vstack(v_list).astype(np.float32)
+
+    if len(rings) > 1:
+        ring_indices = np.cumsum(rings)[:-1].astype(np.uint32)
+    else:
+        ring_indices = np.array([], dtype=np.uint32)
+
+    indices = triangulate_float32(vertices, np.concat([ring_indices, [np.uint32(len(vertices))]], dtype=np.uint32))
+    return vertices, indices
+
+
+def _classify_room_side(wall_center: np.ndarray, perp: np.ndarray, wall_half_thickness: float, rooms: "list[Polygon]", room_tree: STRtree | None) -> np.ndarray:
+    """Determine which perpendicular direction is the 'inner' side (faces a room)."""
+    if room_tree is None or len(rooms) == 0:
+        return perp
+
+    probe_dist = wall_half_thickness + 0.05
+
+    def has_room(pt_2d):
+        pt = Point(pt_2d)
+        for idx in room_tree.query(pt):
+            if rooms[idx].contains(pt):
+                return True
+        return False
+
+    side_a = has_room(wall_center + perp * probe_dist)
+    side_b = has_room(wall_center - perp * probe_dist)
+
+    if side_b and not side_a:
+        return -perp
+    return perp  # default: positive perp = inner
+
+
+def build_element_faces(
+    poly: Polygon,
+    rooms: "list[Polygon]",
+    room_tree: STRtree | None,
+    builder: MeshBuilder,
+    prefix: str,
+    num: int,
+    seg_height: float,
+    offset: float = 0.0,
+):
+    """Build a polygon section as separate face meshes (inner, outer, left, right, top, bottom).
+
+    Works for walls, door-top walls, and window above/below walls.
+    prefix + face + num forms the mesh name, e.g. WallInner_1, DoorTopOuter_3.
+    """
+    start, end = _wall_long_axis(poly)
+    long_vec = end - start
+    length = np.linalg.norm(long_vec)
+
+    if length < 1e-10:
+        verts, indices = triangulate_single_polygon(poly)
+        builder.extrude_shape(indices, verts, height=seg_height, offset=offset)
+        builder.create_mesh(f"{prefix}_{num}", None, None)
+        return
+
+    long_dir = long_vec / length
+    perp = np.array([-long_dir[1], long_dir[0]])
+
+    # Estimate wall half-thickness
+    obb = poly.minimum_rotated_rectangle
+    obb_coords = list(obb.exterior.coords)[:-1]
+    e1 = np.linalg.norm(np.array(obb_coords[1]) - np.array(obb_coords[0]))
+    e2 = np.linalg.norm(np.array(obb_coords[2]) - np.array(obb_coords[1]))
+    wall_half_thickness = min(e1, e2) / 2
+
+    wall_center = np.array(poly.centroid.coords[0])
+    inner_perp = _classify_room_side(wall_center, perp, wall_half_thickness, rooms, room_tree)
+
+    # Triangulate
+    verts, indices = triangulate_single_polygon(poly)
+    poly_centroid = np.array([poly.centroid.x, poly.centroid.y])
+
+    # Find boundary edges (edges used by exactly 1 triangle)
+    edge_usage: dict[tuple[int, int], int] = {}
+    actual_edges: dict[tuple[int, int], tuple[int, int]] = {}
+
+    for i in range(0, len(indices), 3):
+        tri = (int(indices[i]), int(indices[i + 1]), int(indices[i + 2]))
+        for edge in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]:
+            se = tuple(sorted(edge))
+            edge_usage[se] = edge_usage.get(se, 0) + 1
+            actual_edges[se] = edge
+
+    # Classify each boundary edge into face groups
+    inner_quads: list[tuple] = []
+    outer_quads: list[tuple] = []
+    left_quads: list[tuple] = []
+    right_quads: list[tuple] = []
+
+    for se, count in edge_usage.items():
+        if count != 1:
+            continue
+        ae = actual_edges[se]
+        a = verts[ae[1]]  # reversed order (same as extrude_shape)
+        b = verts[ae[0]]
+
+        mid = (np.array(a) + np.array(b)) / 2
+        edge_dir = np.array([b[0] - a[0], b[1] - a[1]])
+        elen = np.linalg.norm(edge_dir)
+        if elen < 1e-10:
+            continue
+
+        # Outward normal: perpendicular direction pointing AWAY from polygon centroid
+        n1 = np.array([-edge_dir[1], edge_dir[0]]) / elen
+        to_centroid = poly_centroid - mid
+        outward_normal = n1 if np.dot(n1, to_centroid) < 0 else -n1
+
+        quad = (
+            [a[0], offset, a[1]],
+            [b[0], offset, b[1]],
+            [b[0], offset + seg_height, b[1]],
+            [a[0], offset + seg_height, a[1]],
+        )
+
+        # Classify: normal mostly along perp → long side; mostly along long_dir → end cap
+        dot_perp = abs(np.dot(outward_normal, perp))
+        dot_long = abs(np.dot(outward_normal, long_dir))
+
+        if dot_perp >= dot_long:
+            if np.dot(outward_normal, inner_perp) > 0:
+                inner_quads.append(quad)
+            else:
+                outer_quads.append(quad)
+        else:
+            if np.dot(outward_normal, long_dir) > 0:
+                right_quads.append(quad)
+            else:
+                left_quads.append(quad)
+
+    # Top face
+    builder.add_mesh_segment(indices[::-1], np.insert(verts, 1, offset + seg_height, axis=1))
+    builder.create_mesh(f"{prefix}Top_{num}", None, None)
+
+    # Bottom face
+    builder.add_mesh_segment(indices, np.insert(verts, 1, offset, axis=1))
+    builder.create_mesh(f"{prefix}Bottom_{num}", None, None)
+
+    # Inner face
+    if inner_quads:
+        for q in inner_quads:
+            builder.add_quad(*q)
+        builder.create_mesh(f"{prefix}Inner_{num}", None, None)
+
+    # Outer face
+    if outer_quads:
+        for q in outer_quads:
+            builder.add_quad(*q)
+        builder.create_mesh(f"{prefix}Outer_{num}", None, None)
+
+    # Left cap
+    if left_quads:
+        for q in left_quads:
+            builder.add_quad(*q)
+        builder.create_mesh(f"{prefix}Left_{num}", None, None)
+
+    # Right cap
+    if right_quads:
+        for q in right_quads:
+            builder.add_quad(*q)
+        builder.create_mesh(f"{prefix}Right_{num}", None, None)
+
+
+def build_wall_faces(
+    wall_poly: Polygon,
+    rooms: "list[Polygon]",
+    room_tree: STRtree | None,
+    builder: MeshBuilder,
+    height: float = 2.6,
+):
+    """Build a single wall polygon as separate face meshes."""
+    wall_num = builder.counters.get("Wall_", 1)
+    builder.counters["Wall_"] = wall_num + 1
+    build_element_faces(wall_poly, rooms, room_tree, builder, "Wall", wall_num, height, 0.0)
+
+
+def build_walls(wall_polygons: "list[Polygon]", rooms: "list[Polygon]", room_tree: STRtree | None, builder: MeshBuilder):
+    """Build wall meshes: split at corners, then by rooms, then decompose into faces."""
+    for poly in wall_polygons:
+        # Phase 1: Split at geometric corners (L/T/U shapes)
+        corner_segments = split_wall_polygon(poly)
+
+        # Phase 2: Split each straight segment by room adjacency
+        for segment in corner_segments:
+            room_segments = split_wall_by_rooms(segment, rooms)
+
+            # Phase 3: Build each final segment as separate face meshes
+            for final_segment in room_segments:
+                build_wall_faces(final_segment, rooms, room_tree, builder)
+
+
+def build_doors(door_polygons: "list[Polygon]", rooms: "list[Polygon]", room_tree: STRtree | None, builder: MeshBuilder, height: float = 2.6):
+    """Build door meshes: door opening + wall-above-door decomposed into faces."""
+    for poly in door_polygons:
+        door_num = builder.counters.get("Door_", 1)
+        builder.counters["Door_"] = door_num + 1
+
+        verts, indices = triangulate_single_polygon(poly)
+
+        # Door opening (solid box from 0 to door height)
+        builder.extrude_shape(indices, verts, height=height * 10 / 13)
+        builder.create_mesh(f"Door_{door_num}", None, None)
+
+        # Wall above door - decomposed into 6 face meshes
+        build_element_faces(poly, rooms, room_tree, builder, "DoorTop", door_num, height * 3 / 13, height * 10 / 13)
+
+
+def build_windows(window_polygons: "list[Polygon]", rooms: "list[Polygon]", room_tree: STRtree | None, builder: MeshBuilder, height: float = 2.6):
+    """Build window meshes: glass area + wall-below and wall-above decomposed into faces."""
+    for poly in window_polygons:
+        win_num = builder.counters.get("Window_", 1)
+        builder.counters["Window_"] = win_num + 1
+
+        verts, indices = triangulate_single_polygon(poly)
+
+        # Window glass area (solid box for the opening, from height/3 to height*2/3)
+        builder.extrude_shape(indices, verts, height=height / 3, offset=height / 3)
+        builder.create_mesh(f"Window_{win_num}", None, None)
+
+        # Wall below window - decomposed into 6 face meshes
+        build_element_faces(poly, rooms, room_tree, builder, "WindowBottom", win_num, height / 3, 0.0)
+
+        # Wall above window - decomposed into 6 face meshes
+        build_element_faces(poly, rooms, room_tree, builder, "WindowTop", win_num, height / 3, height * 2 / 3)
+
+
 def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
     final_vertices = []
     final_indices = []
@@ -165,10 +681,7 @@ def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
         return
 
     if name == "windows":
-        builder.extrude_shape(final_indices, final_vertices, height=height / 3)
-        builder.extrude_shape(final_indices, final_vertices, height=height / 3, offset=height * 2 / 3)
-        builder.create_mesh("Window_", None, None)
-        return
+        raise RuntimeError("Windows must be built via build_windows(), not build_shape()")
 
     if name == "balcony":
         builder.extrude_shape(final_indices, final_vertices, height=height / 3)
@@ -176,17 +689,11 @@ def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
         return
 
     if name == "doors":
-        name = "Door"
-        builder.extrude_shape(final_indices, final_vertices, height=height * 10 / 13)
-        builder.create_mesh("Door_", None, None)
-        builder.extrude_shape(final_indices, final_vertices, height=height * 3 / 13, offset=height * 10 / 13)
-        builder.create_mesh("DoorTop_", None, None)
+        raise RuntimeError("Doors must be built via build_doors(), not build_shape()")
         return
 
     if name == "walls":
-        name = "Wall"
-        builder.extrude_shape(final_indices, final_vertices, height=height)
-        builder.create_mesh("Wall_", None, None)
+        raise RuntimeError("Walls must be built via build_walls(), not build_shape()")
         return
 
     return []
@@ -518,11 +1025,7 @@ def convert_to_gltf(name: str):
 
     extend_doors_and_windows_to_touch_walls(all_shapes)
 
-    # Build wall geometry
-    for shape in all_shapes:
-        build_shape(shape.kind, shape.polygons, builder)
-
-    # Combine all walls for cutting out room shapes
+    # --- Compute rooms FIRST (needed for room-based wall splitting) ---
     all_polygons = list(chain.from_iterable(shape.polygons for shape in all_shapes))
     walls_shape = union_all(all_polygons)
     walls_shape = buffer(walls_shape, 10 * normalizer)
@@ -541,6 +1044,19 @@ def convert_to_gltf(name: str):
 
     # Filter rooms to be only inside the walls
     rooms = [room for room in rooms if room_mask.contains(room.representative_point())]
+
+    # --- Build geometry (walls, doors, windows use face decomposition) ---
+    room_tree = STRtree(rooms) if rooms else None
+
+    for shape in all_shapes:
+        if shape.kind == "walls":
+            build_walls(shape.polygons, rooms, room_tree, builder)
+        elif shape.kind == "doors":
+            build_doors(shape.polygons, rooms, room_tree, builder)
+        elif shape.kind == "windows":
+            build_windows(shape.polygons, rooms, room_tree, builder)
+        else:
+            build_shape(shape.kind, shape.polygons, builder)
 
     # Build floor meshes
     for room in rooms:
