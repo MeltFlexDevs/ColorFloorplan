@@ -234,6 +234,70 @@ def compute_cut_line(polygon: Polygon, corner: ConcaveCorner, epsilon: float = 1
     return candidates[0][1]
 
 
+def compute_corner_cut_line(polygon: Polygon, corner: ConcaveCorner, epsilon: float = 1e-4) -> LineString | None:
+    """Compute an L-shaped cut line through a concave vertex.
+
+    The cut goes: far_boundary_1 → vertex → far_boundary_2, crossing the polygon
+    boundary at two points and passing through the concave vertex. This produces
+    a clean 3-way split (two straight wall segments + a corner square piece)
+    in a single Shapely split() call, avoiding epsilon-overlap issues.
+
+    Falls back to a single straight cut if only one direction yields a hit.
+    """
+    vertex = corner.vertex
+    boundary = polygon.exterior
+    max_len = boundary.length
+    vertex_point = Point(vertex)
+
+    far_ends: list[tuple[np.ndarray, np.ndarray]] = []  # (extended_far_point, direction)
+
+    for direction in [corner.e_in, -corner.e_out]:
+        far_point = vertex + direction * max_len
+        ray = LineString([vertex, far_point])
+
+        intersection = ray.intersection(boundary)
+        if intersection.is_empty:
+            continue
+
+        hit_points: list[Point] = []
+        if isinstance(intersection, MultiPoint):
+            hit_points = list(intersection.geoms)
+        elif isinstance(intersection, Point):
+            hit_points = [intersection]
+        elif isinstance(intersection, GeometryCollection):
+            for geom in intersection.geoms:
+                if isinstance(geom, Point):
+                    hit_points.append(geom)
+                elif isinstance(geom, LineString):
+                    for c in geom.coords:
+                        hit_points.append(Point(c))
+        elif isinstance(intersection, (LineString, MultiLineString)):
+            for c in (intersection.coords if isinstance(intersection, LineString)
+                      else [c for ls in intersection.geoms for c in ls.coords]):
+                hit_points.append(Point(c))
+
+        # Filter out hits at/near the vertex itself
+        hits = [p for p in hit_points if vertex_point.distance(p) > epsilon * 10]
+        if not hits:
+            continue
+
+        nearest = min(hits, key=lambda p: vertex_point.distance(p))
+        dir_norm = direction / np.linalg.norm(direction)
+        # Extend slightly past boundary for robust splitting
+        end = np.array(nearest.coords[0]) + dir_norm * epsilon
+        far_ends.append((end, dir_norm))
+
+    if len(far_ends) == 2:
+        # L-shaped cut: far_end_0 → vertex → far_end_1
+        return LineString([far_ends[0][0], vertex, far_ends[1][0]])
+    elif len(far_ends) == 1:
+        # Fallback: single straight cut (same as original compute_cut_line)
+        start = vertex - far_ends[0][1] * epsilon
+        return LineString([start, far_ends[0][0]])
+
+    return None
+
+
 def split_wall_polygon(
     polygon: Polygon,
     angle_threshold_deg: float = 30.0,
@@ -242,9 +306,9 @@ def split_wall_polygon(
 ) -> list[Polygon]:
     """Split a wall polygon at concave corners into individual straight segments.
 
-    Recursively finds concave corners, cuts across the wall width at each,
-    and returns the list of resulting polygons. Curved walls are preserved
-    because their per-vertex angle changes are below the threshold.
+    At each concave corner, an L-shaped cut through the vertex isolates a corner
+    square piece between the two straight wall segments. Recurses on resulting
+    pieces to handle T-shapes, U-shapes, etc.
     """
     if _depth > 20:
         return [polygon]
@@ -263,7 +327,7 @@ def split_wall_polygon(
     corners.sort(key=lambda c: -c.turn_angle)
 
     for corner in corners:
-        cut_line = compute_cut_line(polygon, corner)
+        cut_line = compute_corner_cut_line(polygon, corner)
         if cut_line is None:
             continue
 
@@ -277,7 +341,7 @@ def split_wall_polygon(
         if len(pieces) < 2:
             continue
 
-        # Successfully split - recurse on each piece
+        # Successfully split — recurse on each piece
         final: list[Polygon] = []
         for piece in pieces:
             final.extend(split_wall_polygon(piece, angle_threshold_deg, min_area, _depth + 1))
