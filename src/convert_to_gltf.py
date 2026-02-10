@@ -681,22 +681,34 @@ def build_doors(door_polygons: "list[Polygon]", rooms: "list[Polygon]", room_tre
 
 
 def build_windows(window_polygons: "list[Polygon]", rooms: "list[Polygon]", room_tree: STRtree | None, builder: MeshBuilder, height: float = 2.6):
-    """Build window meshes: glass area + wall-below and wall-above decomposed into faces."""
+    """Build window meshes: glass area + wall-below and wall-above decomposed into faces.
+
+    Window top is explicitly tied to door top so they always match:
+      - Door top:   height * 10 / 13  (same formula as build_doors)
+      - Parapet:    0.0  to 0.8m      (fixed sill height)
+      - Window:     0.8m to DOOR_TOP  (glass area)
+      - Lintel:     DOOR_TOP to height (wall above window = wall above door)
+    """
+    DOOR_TOP  = height * 10 / 13      # 2.0m — MUST match build_doors door opening height
+    PARAPET_H = 0.8                    # standard sill height (80cm)
+    WINDOW_H  = DOOR_TOP - PARAPET_H  # 1.2m — glass area (parapet to door top)
+    LINTEL_H  = height - DOOR_TOP     # 0.6m — wall above window = wall above door
+
     for poly in window_polygons:
         win_num = builder.counters.get("Window_", 1)
         builder.counters["Window_"] = win_num + 1
 
         verts, indices = triangulate_single_polygon(poly)
 
-        # Window glass area (solid box for the opening, from height/3 to height*2/3)
-        builder.extrude_shape(indices, verts, height=height / 3, offset=height / 3)
+        # Window glass area (from parapet to door-top height)
+        builder.extrude_shape(indices, verts, height=WINDOW_H, offset=PARAPET_H)
         builder.create_mesh(f"Window_{win_num}", None, None)
 
-        # Wall below window - decomposed into 6 face meshes
-        build_element_faces(poly, rooms, room_tree, builder, "WindowBottom", win_num, height / 3, 0.0)
+        # Wall below window (parapet) - decomposed into 6 face meshes
+        build_element_faces(poly, rooms, room_tree, builder, "WindowBottom", win_num, PARAPET_H, 0.0)
 
-        # Wall above window - decomposed into 6 face meshes
-        build_element_faces(poly, rooms, room_tree, builder, "WindowTop", win_num, height / 3, height * 2 / 3)
+        # Wall above window (lintel) - decomposed into 6 face meshes — matches DoorTop
+        build_element_faces(poly, rooms, room_tree, builder, "WindowTop", win_num, LINTEL_H, DOOR_TOP)
 
 
 def build_shape(name: str, merged: "list[Polygon]", builder: MeshBuilder):
