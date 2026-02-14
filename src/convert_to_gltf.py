@@ -17,6 +17,7 @@ from svgpathtools import svg2paths
 
 from .config import DEBUG_ALL_SHAPES, DEBUG_DOOR_FIX, DEBUG_EXTENDING_OBJECTS, DEBUG_OUTPUT, DELETE_SVG, OUTPUT_FOLDER
 from .MeshBuilder import MeshBuilder
+from .room_labels import extract_room_labels
 
 
 def path_to_points(path, distance_step=1.0):
@@ -1137,6 +1138,65 @@ def convert_to_gltf(name: str):
     # Build floor meshes
     for room in rooms:
         build_shape("room", [buffer(room, 15 * normalizer)], builder)
+
+    # --- Match AI room labels to room polygons, embed in GLB extras ---
+    labels = extract_room_labels(name)
+    room_data: dict[str, dict] = {}
+
+    for i, room in enumerate(rooms):
+        room_name = f"Room_{i + 1}"
+        centroid = room.centroid
+        bounds = room.bounds  # (minx, miny, maxx, maxy)
+        room_entry: dict = {
+            "type": "unknown",
+            "center": {"x": float(centroid.x), "z": float(centroid.y)},
+            "bounds": {
+                "minX": float(bounds[0]),
+                "minZ": float(bounds[1]),
+                "maxX": float(bounds[2]),
+                "maxZ": float(bounds[3]),
+            },
+            "area": float(room.area),
+            "outline": [[float(x), float(y)] for x, y in room.exterior.coords],
+        }
+
+        # Find which label falls inside this room
+        for label in labels:
+            lx, ly = label["position"]
+            # Scale pixel coords to normalised world coords
+            label_point = Point(lx * normalizer, ly * normalizer)
+            if room.contains(label_point):
+                room_entry["type"] = label["room_type"]
+                room_entry["labelConfidence"] = float(label["confidence"])
+                labels.remove(label)  # each label used once
+                break
+
+        room_data[room_name] = room_entry
+
+    # Handle unmatched labels: assign to nearest room that has no type yet
+    for label in labels:
+        lx, ly = label["position"]
+        label_point = Point(lx * normalizer, ly * normalizer)
+        best_dist = float("inf")
+        best_room_name: str | None = None
+
+        for room_name, entry in room_data.items():
+            if entry["type"] != "unknown":
+                continue
+            room_poly = rooms[int(room_name.split("_")[1]) - 1]
+            dist = room_poly.exterior.distance(label_point)
+            if dist < best_dist:
+                best_dist = dist
+                best_room_name = room_name
+
+        if best_room_name is not None:
+            room_data[best_room_name]["type"] = label["room_type"]
+            room_data[best_room_name]["labelConfidence"] = float(label["confidence"])
+
+    if room_data:
+        builder.scene_extras = {"rooms": room_data}
+        typed_count = sum(1 for r in room_data.values() if r["type"] != "unknown")
+        print(f"[convert_to_gltf] Embedded {len(room_data)} rooms ({typed_count} classified) in GLB extras")
 
     gltf = builder.build()
     return gltf

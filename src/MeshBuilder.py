@@ -22,7 +22,7 @@ class MeshBuilder:
         self.index_stack: list[int] = []
 
         self.counters: dict[str, int] = {}
-        pass
+        self.scene_extras: dict | None = None
 
     def add_quad(self, a, b, c, d, invert_normals=False):
         i = len(self.vertex_stack)
@@ -209,7 +209,7 @@ class MeshBuilder:
     def build(self):
         model = GLTFModel(
             asset=Asset(version="2.0"),
-            scenes=[Scene(nodes=list(range(len(self.gltf_nodes))))],
+            scenes=[Scene(nodes=list(range(len(self.gltf_nodes))), extras=self.scene_extras)],
             nodes=self.gltf_nodes,
             meshes=self.gltf_meshes,
             buffers=self.gltf_buffers,

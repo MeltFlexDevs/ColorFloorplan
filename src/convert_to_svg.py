@@ -23,11 +23,14 @@ def convert_to_svg(name: str, input: Path | IO[bytes] | BytesIO):
     threshold = 200
 
     # Define all components and their colors
+    # The 5th component (labels/magenta) is processed separately – saved as a
+    # numpy mask for OCR instead of being vectorised with potrace.
     components = [
         ("windows", np.array([255, 0, 0])),
         ("doors", np.array([0, 255, 0])),
         ("walls", np.array([0, 0, 255])),
         ("balcony", np.array([255, 255, 0])),
+        ("labels", np.array([255, 0, 255])),
     ]
 
     # Calculate distances for all colors at once
@@ -47,6 +50,13 @@ def convert_to_svg(name: str, input: Path | IO[bytes] | BytesIO):
         # 1. This is the closest color (exclusive assignment)
         # 2. The distance is below threshold
         matches = np.where((closest_color_idx == idx) & (min_distances < threshold), 0, 255).astype(np.uint8)
+
+        if component == "labels":
+            # Save magenta mask as numpy array for room label extraction.
+            # 1 = magenta pixel, 0 = background.  Don't vectorise with potrace.
+            label_mask = (matches == 0).astype(np.uint8)
+            np.save(output.with_suffix(".labels.npy"), label_mask)
+            continue
 
         # Save the intermediate image
         grayscale = np.repeat(matches[:, :, np.newaxis], 3, axis=2)

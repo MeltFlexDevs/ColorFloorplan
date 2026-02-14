@@ -7,23 +7,26 @@ from google import genai
 from google.oauth2 import service_account
 
 prompt = """YOUR TASK:
-1. Look at the IMAGE - this is the floorplan you must transform
-2. Trace its walls, doors, balcony railing, and windows
-3. Apply these colors: walls=BLUE, balcony railing=YELLOW, doors=GREEN only one solid rectangle for one door (represents closed doors), windows=RED one window = one solid rectangle
-4. Keep the EXACT same room layout, proportions, and structure as the IMAGE
+1. This is floorplan you must transform
+2. Apply these colors: walls=BLUE, balcony railing=YELLOW, doors=GREEN only one solid rectangle for one door (represents closed doors), windows=RED one window = one solid rectangle
+3. Keep the EXACT same room layout, proportions, and structure as the uploaded floorplan
+4. In the CENTER of each room, place a single MAGENTA (RGB 255,0,255) capital letter identifying the room type, 1 room = 1 letter:
+   L = Living room
+   B = Bedroom
+   K = Kitchen
+   T = Bathroom/Toilet
+   H = Hallway/Corridor/Entryway
+   O = Office/Study
+   D = Dining room
+   W = Walk-in closet/Wardrobe/Storage
+   R = Laundry room
+   A = Balcony/Terrace
 
 REMOVE from output:
-- All furniture, appliances, text, labels, dimensions, and annotations
+- All furniture, appliances, dimensions, text (BUT DO NOT REMOVE ROOM TYPE LETTERS)
 - whole door arcs that show door swings
 
-OUTPUT REQUIREMENTS:
-- White background
-- Walls: solid blue fill (thick line)
-- Balcony railings: solid yellow rectangle (thick line)
-- Doors: solid green rectangle (thick line)
-- Windows: solid red rectangle (thick line)
-
-VERIFY BEFORE GENERATING: THERE CANNOT BE ANY GAPS. And door must be solid rectangle with both ends connected to walls, as u can see it on the reference image - this is very IMPORTANT, often time you fail to do this. Make it exactly like i told you, this is VERY IMPORTANT for me, it can save my life."""
+VERIFY BEFORE GENERATING: THERE CANNOT BE ANY GAPS from outside, everything has to be closed. Keep the EXACT same room layout (walls, doors, windows, balcony) - it must match with uploaded floorplan - IMPORTANT!"""
 
 
 def main(filename: str):
