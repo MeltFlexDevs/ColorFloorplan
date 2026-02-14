@@ -1216,11 +1216,27 @@ def convert_to_gltf(name: str):
             raw_y = (img_h - py) * 10.0
             label["position"] = (raw_x, raw_y)
 
+    # Room type priority: when multiple labels land in one room, prefer the
+    # "main" room type over transitional/utility spaces.  Higher = wins.
+    ROOM_TYPE_PRIORITY: dict[str, int] = {
+        "livingRoom": 100,
+        "bedroom": 90,
+        "kitchen": 80,
+        "diningRoom": 75,
+        "office": 70,
+        "bathroom": 60,
+        "laundry": 50,
+        "closet": 40,
+        "balcony": 30,
+        "hallway": 20,
+    }
+
+    # Build room_data entries first (without types)
     for i, room in enumerate(rooms):
         room_name = f"Room_{i + 1}"
         centroid = room.centroid
         bounds = room.bounds  # (minx, miny, maxx, maxy)
-        room_entry: dict = {
+        room_data[room_name] = {
             "type": "unknown",
             "center": {"x": float(centroid.x), "z": float(centroid.y)},
             "bounds": {
@@ -1233,21 +1249,53 @@ def convert_to_gltf(name: str):
             "outline": [[float(x), float(y)] for x, y in room.exterior.coords],
         }
 
-        # Find which label falls inside this room (labels are now in SVG raw coords)
-        for label in labels:
-            lx, ly = label["position"]
-            label_point = Point(lx * normalizer, ly * normalizer)
-            if room.contains(label_point):
-                room_entry["type"] = label["room_type"]
-                room_entry["labelConfidence"] = float(label["confidence"])
-                labels.remove(label)  # each label used once
-                print(f"  ✓ {room_name} = {label['room_type']} (containment)")
-                break
+    # --- Phase 1: collect ALL labels that fall inside each room ---
+    # Use a small buffer to catch labels near walls/boundaries.
+    room_candidates: dict[str, list[dict]] = {f"Room_{i+1}": [] for i in range(len(rooms))}
+    matched_labels: set[int] = set()
 
-        room_data[room_name] = room_entry
+    for li, label in enumerate(labels):
+        lx, ly = label["position"]
+        label_point = Point(lx * normalizer, ly * normalizer)
 
-    # Handle unmatched labels: assign to nearest room that has no type yet
-    for label in labels:
+        for i, room in enumerate(rooms):
+            room_name = f"Room_{i + 1}"
+            # Try exact containment first, then with small buffer for edge labels
+            if room.contains(label_point) or room.buffer(5 * normalizer).contains(label_point):
+                room_candidates[room_name].append(label)
+                matched_labels.add(li)
+                print(f"  ⬡ {room_name} candidate: '{label['letter']}' = {label['room_type']} "
+                      f"(conf={label['confidence']:.2f})")
+                break  # each label belongs to at most one room
+
+    # --- Phase 2: for rooms with multiple candidates, pick highest priority ---
+    used_types: set[str] = set()
+
+    for room_name, candidates in room_candidates.items():
+        if not candidates:
+            continue
+
+        # Sort by priority (desc), then by confidence (desc)
+        candidates.sort(
+            key=lambda c: (ROOM_TYPE_PRIORITY.get(c["room_type"], 0), c["confidence"]),
+            reverse=True,
+        )
+
+        best = candidates[0]
+        room_data[room_name]["type"] = best["room_type"]
+        room_data[room_name]["labelConfidence"] = float(best["confidence"])
+        used_types.add(best["room_type"])
+
+        if len(candidates) > 1:
+            rejected = ", ".join(f"'{c['letter']}'={c['room_type']}" for c in candidates[1:])
+            print(f"  ✓ {room_name} = {best['room_type']} (priority winner over {rejected})")
+        else:
+            print(f"  ✓ {room_name} = {best['room_type']} (containment)")
+
+    # --- Phase 3: unmatched labels → assign to nearest untyped room ---
+    unmatched = [label for li, label in enumerate(labels) if li not in matched_labels]
+
+    for label in unmatched:
         lx, ly = label["position"]
         label_point = Point(lx * normalizer, ly * normalizer)
         best_dist = float("inf")
@@ -1257,7 +1305,7 @@ def convert_to_gltf(name: str):
             if entry["type"] != "unknown":
                 continue
             room_poly = rooms[int(room_name.split("_")[1]) - 1]
-            dist = room_poly.exterior.distance(label_point)
+            dist = room_poly.distance(label_point)
             if dist < best_dist:
                 best_dist = dist
                 best_room_name = room_name
