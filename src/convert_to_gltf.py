@@ -1,6 +1,8 @@
+import re
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import chain
+from pathlib import Path
 from sys import argv
 
 import numpy as np
@@ -18,6 +20,42 @@ from svgpathtools import svg2paths
 from .config import DEBUG_ALL_SHAPES, DEBUG_DOOR_FIX, DEBUG_EXTENDING_OBJECTS, DEBUG_OUTPUT, DELETE_SVG, OUTPUT_FOLDER
 from .MeshBuilder import MeshBuilder
 from .room_labels import extract_room_labels
+
+
+def _parse_potrace_svg_transform(svg_path: Path) -> tuple[float, float, float] | None:
+    """Parse potrace SVG group transform to get (scale_x, scale_y, translate_y).
+
+    Potrace generates SVGs like:
+        <g transform="translate(0.000000,579.000000) scale(0.100000,-0.100000)">
+
+    svgpathtools does NOT apply this transform, so path coordinates are in
+    potrace's internal system (10x scale, y-up from bottom).  We need these
+    values to convert pixel coordinates into the same space.
+
+    Returns (scale_x, scale_y, translate_y) or None if parsing fails.
+    """
+    try:
+        with open(svg_path) as f:
+            # Only read the first 2KB — the transform is always near the top
+            header = f.read(2048)
+
+        m = re.search(
+            r'transform\s*=\s*"'
+            r"translate\(\s*[\d.+-]+\s*,\s*([\d.eE+-]+)\s*\)"
+            r"\s*"
+            r"scale\(\s*([\d.eE+-]+)\s*,\s*([\d.eE+-]+)\s*\)",
+            header,
+        )
+        if m:
+            ty = float(m.group(1))
+            sx = float(m.group(2))
+            sy = float(m.group(3))
+            print(f"[convert_to_gltf] Parsed SVG transform: translate_y={ty}, scale=({sx}, {sy})")
+            return (sx, sy, ty)
+    except Exception as e:
+        print(f"[convert_to_gltf] Warning: could not parse SVG transform: {e}")
+
+    return None
 
 
 def path_to_points(path, distance_step=1.0):
@@ -1055,8 +1093,14 @@ def convert_to_gltf(name: str):
 
     all_shapes: list[Shape] = []
 
+    svg_transform: tuple[float, float, float] | None = None
+
     for component in ["windows", "walls", "doors", "balcony"]:
         filename = OUTPUT_FOLDER / f"{name}.{component}.svg"
+
+        # Parse the potrace SVG transform from the first available SVG (before deletion)
+        if svg_transform is None and filename.exists():
+            svg_transform = _parse_potrace_svg_transform(filename)
 
         for shape_polygons in load_shapes(filename):
             # Create a shape from the polygons parsed from the SVG path. The path may be degenerate
@@ -1140,8 +1184,37 @@ def convert_to_gltf(name: str):
         build_shape("room", [buffer(room, 15 * normalizer)], builder)
 
     # --- Match AI room labels to room polygons, embed in GLB extras ---
-    labels = extract_room_labels(name)
+    labels, label_image_shape = extract_room_labels(name)
     room_data: dict[str, dict] = {}
+
+    # Convert label positions from pixel coordinates to SVG raw coordinate space.
+    # svgpathtools does NOT apply the potrace group transform, so room polygons
+    # are in potrace's internal coords (10x scale, y-up from bottom).  Labels
+    # come from the pixel mask (1x scale, y-down from top).
+    if labels and svg_transform is not None:
+        svg_sx, svg_sy, svg_ty = svg_transform
+        print(f"[convert_to_gltf] Converting {len(labels)} label(s) from pixel to SVG coords "
+              f"(sx={svg_sx}, sy={svg_sy}, ty={svg_ty})")
+        for label in labels:
+            px, py = label["position"]
+            # Potrace transform: display = translate(0,ty) · scale(sx,sy) · raw
+            #   display_x = raw_x * sx
+            #   display_y = raw_y * sy + ty
+            # So: raw_x = display_x / sx = pixel_x / sx
+            #     raw_y = (display_y - ty) / sy = (pixel_y - ty) / sy
+            raw_x = px / svg_sx
+            raw_y = (py - svg_ty) / svg_sy
+            label["position"] = (raw_x, raw_y)
+            print(f"  Label '{label['letter']}' pixel({px:.0f},{py:.0f}) → svg_raw({raw_x:.0f},{raw_y:.0f})")
+    elif labels and svg_transform is None and label_image_shape is not None:
+        # Fallback: assume standard potrace defaults (scale=0.1/-0.1, translate=height)
+        img_h = label_image_shape[0]
+        print(f"[convert_to_gltf] SVG transform not parsed, using fallback (10x, y-flip, h={img_h})")
+        for label in labels:
+            px, py = label["position"]
+            raw_x = px * 10.0
+            raw_y = (img_h - py) * 10.0
+            label["position"] = (raw_x, raw_y)
 
     for i, room in enumerate(rooms):
         room_name = f"Room_{i + 1}"
@@ -1160,15 +1233,15 @@ def convert_to_gltf(name: str):
             "outline": [[float(x), float(y)] for x, y in room.exterior.coords],
         }
 
-        # Find which label falls inside this room
+        # Find which label falls inside this room (labels are now in SVG raw coords)
         for label in labels:
             lx, ly = label["position"]
-            # Scale pixel coords to normalised world coords
             label_point = Point(lx * normalizer, ly * normalizer)
             if room.contains(label_point):
                 room_entry["type"] = label["room_type"]
                 room_entry["labelConfidence"] = float(label["confidence"])
                 labels.remove(label)  # each label used once
+                print(f"  ✓ {room_name} = {label['room_type']} (containment)")
                 break
 
         room_data[room_name] = room_entry
@@ -1192,6 +1265,7 @@ def convert_to_gltf(name: str):
         if best_room_name is not None:
             room_data[best_room_name]["type"] = label["room_type"]
             room_data[best_room_name]["labelConfidence"] = float(label["confidence"])
+            print(f"  ~ {best_room_name} = {label['room_type']} (nearest, dist={best_dist:.1f})")
 
     if room_data:
         builder.scene_extras = {"rooms": room_data}

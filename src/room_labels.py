@@ -416,7 +416,7 @@ def _match_letter(
 # Public API
 # ---------------------------------------------------------------------------
 
-def extract_room_labels(name: str, min_confidence: float = 0.10) -> list[dict]:
+def extract_room_labels(name: str, min_confidence: float = 0.10) -> tuple[list[dict], tuple[int, int] | None]:
     """Extract room type labels from the magenta mask saved by convert_to_svg.
 
     Args:
@@ -424,26 +424,26 @@ def extract_room_labels(name: str, min_confidence: float = 0.10) -> list[dict]:
         min_confidence: Minimum IoU to accept a match (0..1).
 
     Returns:
-        List of dicts with keys:
-            letter (str):      Best-matching letter (e.g. "L", "B").
-            room_type (str):   Mapped room type (e.g. "livingRoom").
-            position (tuple):  Centroid (x, y) in *pixel* coordinates.
-            confidence (float): IoU score of the match.
+        Tuple of (labels, image_shape) where:
+            labels: list of dicts with keys letter, room_type, position, confidence.
+            image_shape: (height, width) of the source image, or None if no mask found.
     """
     mask_path = OUTPUT_FOLDER / f"{name}.labels.npy"
 
     if not mask_path.exists():
         print("[room_labels] No labels mask found – skipping room classification")
-        return []
+        return [], None
 
     try:
         mask: np.ndarray = np.load(mask_path)
     finally:
         mask_path.unlink(missing_ok=True)
 
+    image_shape: tuple[int, int] = (mask.shape[0], mask.shape[1])
+
     if not mask.any():
         print("[room_labels] No magenta pixels detected in image")
-        return []
+        return [], image_shape
 
     # Dilate to fix anti-aliasing gaps within letters
     mask = _dilate_mask(mask)
@@ -492,4 +492,4 @@ def extract_room_labels(name: str, min_confidence: float = 0.10) -> list[dict]:
             )
 
     print(f"[room_labels] Recognised {len(results)} room label(s)")
-    return results
+    return results, image_shape
