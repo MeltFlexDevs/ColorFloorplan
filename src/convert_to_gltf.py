@@ -1187,133 +1187,169 @@ def convert_to_gltf(name: str):
     labels, label_image_shape = extract_room_labels(name)
     room_data: dict[str, dict] = {}
 
-    # Convert label positions from pixel coordinates to SVG raw coordinate space.
-    # svgpathtools does NOT apply the potrace group transform, so room polygons
-    # are in potrace's internal coords (10x scale, y-up from bottom).  Labels
-    # come from the pixel mask (1x scale, y-down from top).
-    if labels and svg_transform is not None:
-        svg_sx, svg_sy, svg_ty = svg_transform
-        print(f"[convert_to_gltf] Converting {len(labels)} label(s) from pixel to SVG coords "
-              f"(sx={svg_sx}, sy={svg_sy}, ty={svg_ty})")
-        for label in labels:
-            px, py = label["position"]
-            # Potrace transform: display = translate(0,ty) · scale(sx,sy) · raw
-            #   display_x = raw_x * sx
-            #   display_y = raw_y * sy + ty
-            # So: raw_x = display_x / sx = pixel_x / sx
-            #     raw_y = (display_y - ty) / sy = (pixel_y - ty) / sy
-            raw_x = px / svg_sx
-            raw_y = (py - svg_ty) / svg_sy
-            label["position"] = (raw_x, raw_y)
-            print(f"  Label '{label['letter']}' pixel({px:.0f},{py:.0f}) → svg_raw({raw_x:.0f},{raw_y:.0f})")
-    elif labels and svg_transform is None and label_image_shape is not None:
-        # Fallback: assume standard potrace defaults (scale=0.1/-0.1, translate=height)
-        img_h = label_image_shape[0]
-        print(f"[convert_to_gltf] SVG transform not parsed, using fallback (10x, y-flip, h={img_h})")
-        for label in labels:
-            px, py = label["position"]
-            raw_x = px * 10.0
-            raw_y = (img_h - py) * 10.0
-            label["position"] = (raw_x, raw_y)
-
-    # Room type priority: when multiple labels land in one room, prefer the
-    # "main" room type over transitional/utility spaces.  Higher = wins.
+    # Room type priority: when multiple labels compete for one room, higher wins.
     ROOM_TYPE_PRIORITY: dict[str, int] = {
-        "livingRoom": 100,
-        "bedroom": 90,
-        "kitchen": 80,
-        "diningRoom": 75,
-        "office": 70,
-        "bathroom": 60,
-        "laundry": 50,
-        "closet": 40,
-        "balcony": 30,
-        "hallway": 20,
+        "livingRoom": 100, "bedroom": 90, "kitchen": 80, "diningRoom": 75,
+        "office": 70, "bathroom": 60, "laundry": 50, "closet": 40,
+        "balcony": 30, "hallway": 20,
     }
 
-    # Build room_data entries first (without types)
+    # Build room_data entries (without types yet)
+    room_centroids_norm: list[Point] = []   # room centroids in normalised world coords
     for i, room in enumerate(rooms):
         room_name = f"Room_{i + 1}"
         centroid = room.centroid
-        bounds = room.bounds  # (minx, miny, maxx, maxy)
+        bounds = room.bounds
         room_data[room_name] = {
             "type": "unknown",
             "center": {"x": float(centroid.x), "z": float(centroid.y)},
             "bounds": {
-                "minX": float(bounds[0]),
-                "minZ": float(bounds[1]),
-                "maxX": float(bounds[2]),
-                "maxZ": float(bounds[3]),
+                "minX": float(bounds[0]), "minZ": float(bounds[1]),
+                "maxX": float(bounds[2]), "maxZ": float(bounds[3]),
             },
             "area": float(room.area),
             "outline": [[float(x), float(y)] for x, y in room.exterior.coords],
         }
+        room_centroids_norm.append(centroid)
 
-    # --- Phase 1: collect ALL labels that fall inside each room ---
-    # Use a small buffer to catch labels near walls/boundaries.
-    room_candidates: dict[str, list[dict]] = {f"Room_{i+1}": [] for i in range(len(rooms))}
-    matched_labels: set[int] = set()
+    if not labels:
+        print("[convert_to_gltf] No labels to match")
+    elif rooms:
+        # ─── AUTO-DETECT COORDINATE SYSTEM ───────────────────────────────
+        # Room polygons are in normalised-SVG-raw coords.  Label positions
+        # are in pixel coords.  Potrace can apply 10× scale + y-flip, but
+        # instead of trusting one transform, try several and pick the one
+        # that best matches labels to rooms (most containments + smallest
+        # total distance to room centroids).
 
-    for li, label in enumerate(labels):
-        lx, ly = label["position"]
-        label_point = Point(lx * normalizer, ly * normalizer)
+        pixel_positions = [label["position"] for label in labels]
+        img_h = label_image_shape[0] if label_image_shape else 0
 
-        for i, room in enumerate(rooms):
-            room_name = f"Room_{i + 1}"
-            # Try exact containment first, then with small buffer for edge labels
-            if room.contains(label_point) or room.buffer(5 * normalizer).contains(label_point):
-                room_candidates[room_name].append(label)
-                matched_labels.add(li)
-                print(f"  ⬡ {room_name} candidate: '{label['letter']}' = {label['room_type']} "
-                      f"(conf={label['confidence']:.2f})")
-                break  # each label belongs to at most one room
+        # Build candidate transforms: each converts (px, py) → (norm_x, norm_y)
+        transforms: list[tuple[str, list[tuple[float, float]]]] = []
 
-    # --- Phase 2: for rooms with multiple candidates, pick highest priority ---
-    used_types: set[str] = set()
+        # A) Parsed SVG transform (most reliable if available)
+        if svg_transform is not None:
+            sx, sy, ty = svg_transform
+            pts = [((px / sx) * normalizer, ((py - ty) / sy) * normalizer) for px, py in pixel_positions]
+            transforms.append(("svg_transform", pts))
 
-    for room_name, candidates in room_candidates.items():
-        if not candidates:
-            continue
+        # B) Standard potrace defaults: 10× scale, y-flip
+        if img_h > 0:
+            pts = [(px * 10 * normalizer, (img_h - py) * 10 * normalizer) for px, py in pixel_positions]
+            transforms.append(("potrace_default", pts))
 
-        # Sort by priority (desc), then by confidence (desc)
-        candidates.sort(
-            key=lambda c: (ROOM_TYPE_PRIORITY.get(c["room_type"], 0), c["confidence"]),
-            reverse=True,
-        )
+        # C) Direct pixel × normalizer (no transform — in case svgpathtools
+        #    DID apply the group transform in some version)
+        pts_direct = [(px * normalizer, py * normalizer) for px, py in pixel_positions]
+        transforms.append(("direct", pts_direct))
 
-        best = candidates[0]
-        room_data[room_name]["type"] = best["room_type"]
-        room_data[room_name]["labelConfidence"] = float(best["confidence"])
-        used_types.add(best["room_type"])
+        # D) Pixel with only y-flip (no 10× scale)
+        if img_h > 0:
+            pts = [(px * normalizer, (img_h - py) * normalizer) for px, py in pixel_positions]
+            transforms.append(("y_flip_only", pts))
 
-        if len(candidates) > 1:
-            rejected = ", ".join(f"'{c['letter']}'={c['room_type']}" for c in candidates[1:])
-            print(f"  ✓ {room_name} = {best['room_type']} (priority winner over {rejected})")
-        else:
-            print(f"  ✓ {room_name} = {best['room_type']} (containment)")
+        # Score each transform: count containments + total distance to nearest centroid
+        best_transform_name = "direct"
+        best_points = pts_direct
+        best_score = (-1, float("inf"))  # (containments DESC, total_dist ASC)
 
-    # --- Phase 3: unmatched labels → assign to nearest untyped room ---
-    unmatched = [label for li, label in enumerate(labels) if li not in matched_labels]
+        for t_name, t_pts in transforms:
+            containments = 0
+            total_dist = 0.0
+            for tx, ty_val in t_pts:
+                pt = Point(tx, ty_val)
+                min_dist = float("inf")
+                for room in rooms:
+                    if room.contains(pt):
+                        containments += 1
+                        min_dist = 0.0
+                        break
+                    d = room.distance(pt)
+                    if d < min_dist:
+                        min_dist = d
+                if min_dist > 0:
+                    total_dist += min_dist
 
-    for label in unmatched:
-        lx, ly = label["position"]
-        label_point = Point(lx * normalizer, ly * normalizer)
-        best_dist = float("inf")
-        best_room_name: str | None = None
+            score = (containments, -total_dist)  # more containments = better; less distance = better
+            print(f"[convert_to_gltf] Transform '{t_name}': {containments}/{len(t_pts)} containments, "
+                  f"total_dist={total_dist:.1f}")
 
-        for room_name, entry in room_data.items():
-            if entry["type"] != "unknown":
+            if score > best_score:
+                best_score = score
+                best_transform_name = t_name
+                best_points = t_pts
+
+        print(f"[convert_to_gltf] Selected transform: '{best_transform_name}' "
+              f"({best_score[0]}/{len(labels)} containments)")
+
+        # Apply the winning transform to labels
+        label_points_norm: list[Point] = []
+        for i_l, (nx, ny) in enumerate(best_points):
+            label_points_norm.append(Point(nx, ny))
+            labels[i_l]["_point"] = Point(nx, ny)
+
+        # ─── PHASE 1: Containment matching (with buffer for near-boundary) ──
+        room_candidates: dict[str, list[dict]] = {f"Room_{i+1}": [] for i in range(len(rooms))}
+        matched_label_indices: set[int] = set()
+
+        for li, label in enumerate(labels):
+            pt = label["_point"]
+            for ri, room in enumerate(rooms):
+                rn = f"Room_{ri + 1}"
+                if room.contains(pt) or buffer(room, 10 * normalizer).contains(pt):
+                    room_candidates[rn].append(label)
+                    matched_label_indices.add(li)
+                    print(f"  ⬡ {rn} ← '{label['letter']}'={label['room_type']} (containment)")
+                    break
+
+        # ─── PHASE 2: Pick best label per room (priority) ───────────────
+        for rn, candidates in room_candidates.items():
+            if not candidates:
                 continue
-            room_poly = rooms[int(room_name.split("_")[1]) - 1]
-            dist = room_poly.distance(label_point)
-            if dist < best_dist:
-                best_dist = dist
-                best_room_name = room_name
+            candidates.sort(
+                key=lambda c: (ROOM_TYPE_PRIORITY.get(c["room_type"], 0), c["confidence"]),
+                reverse=True,
+            )
+            best = candidates[0]
+            room_data[rn]["type"] = best["room_type"]
+            room_data[rn]["labelConfidence"] = float(best["confidence"])
+            if len(candidates) > 1:
+                rejected = ", ".join(f"'{c['letter']}'={c['room_type']}" for c in candidates[1:])
+                print(f"  ✓ {rn} = {best['room_type']} (priority winner, rejected: {rejected})")
+            else:
+                print(f"  ✓ {rn} = {best['room_type']}")
 
-        if best_room_name is not None:
-            room_data[best_room_name]["type"] = label["room_type"]
-            room_data[best_room_name]["labelConfidence"] = float(label["confidence"])
-            print(f"  ~ {best_room_name} = {label['room_type']} (nearest, dist={best_dist:.1f})")
+        # ─── PHASE 3: Distance-based matching for remaining labels ──────
+        # Greedy: sort all (label, room) pairs by distance, assign closest first.
+        unmatched_labels = [(li, labels[li]) for li in range(len(labels)) if li not in matched_label_indices]
+        untyped_rooms = {rn for rn, entry in room_data.items() if entry["type"] == "unknown"}
+
+        if unmatched_labels and untyped_rooms:
+            pairs: list[tuple[float, int, str, dict]] = []  # (dist, label_idx, room_name, label)
+            for li, label in unmatched_labels:
+                pt = label["_point"]
+                for rn in untyped_rooms:
+                    ri = int(rn.split("_")[1]) - 1
+                    dist = rooms[ri].centroid.distance(pt)
+                    pairs.append((dist, li, rn, label))
+
+            pairs.sort(key=lambda p: p[0])
+            assigned_labels: set[int] = set()
+            assigned_rooms: set[str] = set()
+
+            for dist, li, rn, label in pairs:
+                if li in assigned_labels or rn in assigned_rooms:
+                    continue
+                room_data[rn]["type"] = label["room_type"]
+                room_data[rn]["labelConfidence"] = float(label["confidence"])
+                assigned_labels.add(li)
+                assigned_rooms.add(rn)
+                print(f"  ~ {rn} = {label['room_type']} (distance={dist:.1f})")
+
+        # Clean up temporary keys
+        for label in labels:
+            label.pop("_point", None)
 
     if room_data:
         builder.scene_extras = {"rooms": room_data}
