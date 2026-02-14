@@ -575,19 +575,35 @@ def extract_room_labels(name: str, min_confidence: float = 0.10) -> tuple[list[d
         print("[room_labels] No letter blobs found (all too small or too large)")
         return [], image_shape
 
-    print(f"[room_labels] Found {len(blobs)} potential letter blob(s)")
+    # Minimum blob dimension: both width AND height must be at least this.
+    # Rejects 3px-tall anti-aliased edge artifacts along walls.
+    min_dim = max(10, int(min(image_shape) * 0.02))
+
+    print(f"[room_labels] Found {len(blobs)} raw blob(s), min_dim={min_dim}")
 
     results: list[dict] = []
 
     for blob in blobs:
         min_y, max_y, min_x, max_x = blob["bbox"]
-
-        # Aspect ratio sanity (letters are not extremely wide or tall)
         blob_h = max_y - min_y + 1
         blob_w = max_x - min_x + 1
+
+        # --- Noise rejection filters ---
+
+        # 1. Minimum dimension: both axes must be large enough to be a letter
+        if blob_h < min_dim or blob_w < min_dim:
+            continue
+
+        # 2. Aspect ratio: capital letters are roughly square (0.3 - 2.5)
         aspect = blob_w / blob_h if blob_h > 0 else 0
-        if aspect < 0.15 or aspect > 6.0:
+        if aspect < 0.25 or aspect > 2.5:
             print(f"  Blob id={blob['id']} skipped: bad aspect ratio {aspect:.2f}")
+            continue
+
+        # 3. Fill density: reject sparse scattered-pixel blobs (real letters >= 40%)
+        fill_density = blob["area"] / (blob_h * blob_w)
+        if fill_density < 0.20:
+            print(f"  Blob id={blob['id']} skipped: low fill density {fill_density:.2f}")
             continue
 
         # Crop the blob from the labeled array
@@ -597,7 +613,8 @@ def extract_room_labels(name: str, min_confidence: float = 0.10) -> tuple[list[d
 
         print(
             f"  Blob at ({blob['centroid'][0]:.0f}, {blob['centroid'][1]:.0f}): "
-            f"'{letter}' (score: {confidence:.3f}, area: {blob['area']}px)"
+            f"'{letter}' (score: {confidence:.3f}, area: {blob['area']}px, "
+            f"size: {blob_w}x{blob_h}, fill: {fill_density:.0%})"
         )
 
         if confidence >= min_confidence:
